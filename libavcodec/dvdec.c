@@ -35,6 +35,10 @@
  * DV decoder
  */
 
+
+#include "config.h"
+#include "config_components.h"
+
 #include "libavutil/avassert.h"
 #include "libavutil/internal.h"
 #include "libavutil/mem_internal.h"
@@ -52,6 +56,9 @@
 #include "put_bits.h"
 #include "simple_idct.h"
 #include "thread.h"
+
+#include "hwconfig.h"
+#include "vulkan/vulkan.h"
 
 typedef struct BlockInfo {
     const uint32_t *factor_table;
@@ -270,6 +277,12 @@ static av_cold int dvvideo_decode_init(AVCodecContext *avctx)
 
     ff_thread_once(&init_static_once, dv_init_static);
 
+    return 0;
+}
+
+static int dvvideo_update_thread_context(AVCodecContext *dst,
+                                         const AVCodecContext *src)
+{
     return 0;
 }
 
@@ -642,7 +655,20 @@ static int dvvideo_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
     s->frame            = frame;
+#if CONFIG_DV_VULKAN_HWACCEL
+    {
+        enum AVPixelFormat pix_fmts[] = {
+            AV_PIX_FMT_VULKAN,
+            s->sys->pix_fmt,
+            AV_PIX_FMT_NONE
+        };
+        avctx->pix_fmt  = ff_get_format(avctx, pix_fmts);
+        if (avctx->pix_fmt == AV_PIX_FMT_NONE)
+            return AVERROR(EINVAL);
+    }
+#else
     avctx->pix_fmt      = s->sys->pix_fmt;
+#endif
     avctx->framerate    = av_inv_q(s->sys->time_base);
     avctx->bit_rate     = av_rescale_q(s->sys->frame_size,
                                        (AVRational) { 8, 1 },
@@ -688,6 +714,19 @@ static int dvvideo_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     return s->sys->frame_size;
 }
 
+static const AVCodecHWConfigInternal *const dv_hw_configs[] = {
+    &(const AVCodecHWConfigInternal) {
+        .public = {
+            .pix_fmt     = AV_PIX_FMT_VULKAN,
+            .methods     = AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX |
+                           AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX,
+            .device_type = AV_HWDEVICE_TYPE_VULKAN,
+        },
+        .hwaccel = &ff_dv_vulkan_hwaccel,
+    },
+    NULL
+};
+
 const FFCodec ff_dvvideo_decoder = {
     .p.name         = "dvvideo",
     CODEC_LONG_NAME("DV (Digital Video)"),
@@ -695,7 +734,12 @@ const FFCodec ff_dvvideo_decoder = {
     .p.id           = AV_CODEC_ID_DVVIDEO,
     .priv_data_size = sizeof(DVDecContext),
     .init           = dvvideo_decode_init,
+    .update_thread_context = dvvideo_update_thread_context,
     FF_CODEC_DECODE_CB(dvvideo_decode_frame),
     .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_SLICE_THREADS,
     .p.max_lowres   = 3,
+    .hw_configs     = dv_hw_configs,
+    .p.pix_fmts     = (const enum AVPixelFormat[]) {
+        AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P, AV_PIX_FMT_VULKAN, AV_PIX_FMT_NONE
+    }
 };
