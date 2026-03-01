@@ -24,7 +24,7 @@ Afterwards to not recompile everything every time you make a change, you can use
 make -j$(nproc)
 ```
 
-After either of these you can use the following to install the FFmpeg binariy globally on your system:
+After either of these you can use the following to install the FFmpeg binary globally on your system:
 ```
 make install
 ```
