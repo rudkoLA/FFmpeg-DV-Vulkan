@@ -1,46 +1,51 @@
-FFmpeg README
-=============
+# FFmpeg DV Video Vulkan Hardware Acceleration
 
-FFmpeg is a collection of libraries and tools to process multimedia content
-such as audio, video, subtitles and related metadata.
+Base FFmpeg README can be found [here](FFMPEG_README.md).
 
-## Libraries
+## Installation
+GNU Make >= 3.81 is needed to compile FFmpeg.
 
-* `libavcodec` provides implementation of a wider range of codecs.
-* `libavformat` implements streaming protocols, container formats and basic I/O access.
-* `libavutil` includes hashers, decompressors and miscellaneous utility functions.
-* `libavfilter` provides means to alter decoded audio and video through a directed graph of connected filters.
-* `libavdevice` provides an abstraction to access capture and playback devices.
-* `libswresample` implements audio mixing and resampling routines.
-* `libswscale` implements color conversion and scaling routines.
+Most importantly you need to install a Vulkan version >= 1.3.277. It is recommended to do so using https://vulkan.lunarg.com/sdk/home as other means may install older non supported version (e.g. on Ubuntu 24.04, `sudo apt install libvulkan1` will install Vulkan version 1.3.275 which is incompatible with FFmpeg).
 
-## Tools
+Other dependencies may include `libvulkan-dev vulkan-tools vulkan-headers glslang-tools libglslang-dev` or their equivalents on other operating systems. But these will most likely be explained by FFmpeg, while the vulkan one may be difficult to track down.
 
-* [ffmpeg](https://ffmpeg.org/ffmpeg.html) is a command line toolbox to
-  manipulate, convert and stream multimedia content.
-* [ffplay](https://ffmpeg.org/ffplay.html) is a minimalistic multimedia player.
-* [ffprobe](https://ffmpeg.org/ffprobe.html) is a simple analysis tool to inspect
-  multimedia content.
-* Additional small tools such as `aviocat`, `ismindex` and `qt-faststart`.
+## Compiling
 
-## Documentation
+To fully compile FFmpeg with Vulkan hardware acceleration use the following commands:
 
-The offline documentation is available in the **doc/** directory.
+```
+./configure --enable-vulkan
+make
+```
 
-The online documentation is available in the main [website](https://ffmpeg.org)
-and in the [wiki](https://trac.ffmpeg.org).
+Afterwards to not recompile everything every time you make a change, you can use the following command to only recompile based on the changed files:
 
-### Examples
+```
+make -j$(nproc)
+```
 
-Coding examples are available in the **doc/examples** directory.
+After either of these you can use the following to install the FFmpeg binariy globally on your system:
+```
+make install
+```
 
-## License
+## Usage
 
-FFmpeg codebase is mainly LGPL-licensed with optional components licensed under
-GPL. Please refer to the LICENSE file for detailed information.
+To encode any video to the DV format you can use the following command:
 
-## Contributing
+```
+ffmpeg -i [file name] -target ntsc-dv input.dv
+```
 
-Patches should be submitted to the ffmpeg-devel mailing list using
-`git format-patch` or `git send-email`. Github pull requests should be
-avoided because they are not part of our review process and will be ignored.
+Then to decode using **software** decoding you may use the following:
+```
+ffmpeg -i input.dv -c:v mpeg4 -qscale:v 3 -c:a aac output.mp4
+```
+
+And currently, as proper Vulkan decoding is not yet implemented, you should use the following in the meantime to test decoding DV using Vulkan:
+
+```
+./ffmpeg -init_hw_device vulkan -hwaccel vulkan -i input.dv -f null -
+```
+
+Additionally `-v debug` flag may be helpful to further debug console output.
