@@ -1304,6 +1304,7 @@ OBJS-$(CONFIG_WEBP_PARSER)             += webp_parser.o
 OBJS-$(CONFIG_XBM_PARSER)              += xbm_parser.o
 OBJS-$(CONFIG_XMA_PARSER)              += xma_parser.o
 OBJS-$(CONFIG_XWD_PARSER)              += xwd_parser.o
+OBJS-$(CONFIG_DV_VULKAN_HWACCEL)          += dvdec_vulkan.o
 
 # bitstream filters
 include $(SRC_PATH)/libavcodec/bsf/Makefile
