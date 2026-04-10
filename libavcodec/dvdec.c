@@ -47,6 +47,7 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "decode.h"
+#include "hwaccel_internal.h"
 #include "dv.h"
 #include "dv_internal.h"
 #include "dv_profile_internal.h"
@@ -703,6 +704,30 @@ static int dvvideo_decode_frame(AVCodecContext *avctx, AVFrame *frame,
             frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST * !(vsc_pack[3] & 0x40);
         }
     }
+
+    #if CONFIG_DV_VULKAN_HWACCEL
+        if (avctx->pix_fmt == AV_PIX_FMT_VULKAN) {
+            if (FF_HW_HAS_CB(avctx, start_frame)) {
+                ret = FF_HW_CALL(avctx, start_frame, NULL,
+                                avpkt->data, avpkt->size);
+                if (ret < 0)
+                    return ret;
+            }
+            if (FF_HW_HAS_CB(avctx, decode_slice)) {
+                ret = FF_HW_CALL(avctx, decode_slice,
+                                avpkt->data, avpkt->size);
+                if (ret < 0)
+                    return ret;
+            }
+            if (FF_HW_HAS_CB(avctx, end_frame)) {
+                ret = FF_HW_SIMPLE_CALL(avctx, end_frame);
+                if (ret < 0)
+                    return ret;
+            }
+            *got_frame = 1;
+            return s->sys->frame_size;
+        }
+    #endif
 
     s->buf = buf;
     avctx->execute(avctx, dv_decode_video_segment, s->work_chunks, NULL,
