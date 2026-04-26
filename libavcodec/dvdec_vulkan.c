@@ -89,6 +89,7 @@ typedef struct DVSubContext {
 
     uint8_t *frame_packet;
     size_t   frame_packet_size;
+    int      frame_packet_from_start;
 
     DVwork_chunk work_chunks[DV_MAX_WORK_CHUNKS];
 
@@ -126,7 +127,7 @@ typedef struct DVSubContext {
     uint8_t        *recon_jobs_buf_map;
     FFVkBuffer      recon_plane_buf;
     size_t          recon_plane_buf_size;
-    uint32_t       *recon_plane_buf_map;
+    uint8_t        *recon_plane_buf_map;
     int             dequant_gpu_ready;
     int             idct_gpu_ready;
     int             recon_gpu_ready;
@@ -141,6 +142,7 @@ typedef struct DVSubContext {
     int      coeff_blocks_are_spatial;
     int      idct_upload_ready;
     int      cpu_output_required;
+    int      dequant_output_in_idct_buf;
 
     DVPipelineStats stats;
 
@@ -167,8 +169,8 @@ typedef struct DVVkIDCTPush {
 typedef struct DVVkDequantPush {
     uint32_t num_coeffs;
     uint32_t iweight_bits;
-    uint32_t reserved0;
-    uint32_t reserved1;
+    uint32_t output_stride;
+    uint32_t output_base;
 } DVVkDequantPush;
 
 typedef struct DVVkReconJob {
@@ -470,8 +472,8 @@ static void dv_vk_build_dequant_shader_source(FFVulkanShader *shd)
         0, layout(push_constant) uniform PushConstants {                     );
             GLSLC(1, uint num_coeffs;);
             GLSLC(1, uint iweight_bits;);
-            GLSLC(1, uint reserved0;);
-            GLSLC(1, uint reserved1;);
+            GLSLC(1, uint output_stride;);
+            GLSLC(1, uint output_base;);
     GLSLC(0,
         } pc;);
     GLSLC(
@@ -483,7 +485,13 @@ static void dv_vk_build_dequant_shader_source(FFVulkanShader *shd)
             GLSLC(1, int value = q;);
             GLSLC(1, if ((idx & 63u) != 0u));
             GLSLC(2, value = int((uint(q) * factors[idx] + (1u << (pc.iweight_bits - 1u))) >> pc.iweight_bits););
-            GLSLC(1, dequantized[idx] = value;);
+            GLSLC(1, uint out_idx = idx;);
+            GLSLC(1, if (pc.output_stride != 0u) {);
+                GLSLC(2, uint block = idx >> 6u;);
+                GLSLC(2, uint coeff = idx & 63u;);
+                GLSLC(2, out_idx = pc.output_base + block * pc.output_stride + coeff;);
+            GLSLC(1, });
+            GLSLC(1, dequantized[out_idx] = value;);
     GLSLC(0,
         });
 }
@@ -684,7 +692,7 @@ static void dv_vk_build_recon_calc_shader_source(FFVulkanShader *shd)
 
     GLSLC(
         0, void store_byte(uint idx, uint value) {                  );
-            GLSLC(1, data[idx] = value & 255u;);
+            GLSLC(1, data[idx] = uint8_t(value & 255u););
     GLSLC(0,
         });
 
@@ -843,10 +851,12 @@ static void dv_vk_build_recon_shader_source(FFVulkanShader *shd)
 static void dv_vk_reset_frame_state(DVSubContext *s)
 {
     s->frame_packet_size        = 0;
+    s->frame_packet_from_start  = 0;
     s->stats                    = (DVPipelineStats){0};
     s->coeff_blocks_are_spatial = 0;
     s->idct_upload_ready        = 0;
     s->cpu_output_required      = 0;
+    s->dequant_output_in_idct_buf = 0;
 }
 
 static int dv_vk_cache_packet(DVSubContext *s, const uint8_t *data, uint32_t size)
@@ -975,7 +985,6 @@ static int dv_vk_prepare_coeff_staging(DVSubContext *s)
         s->dequant_blocks_alloc = needed_coeffs;
     }
 
-    memset(s->coeff_blocks, 0, needed_coeffs * sizeof(*s->coeff_blocks));
     memset(s->quant_blocks, 0, needed_coeffs * sizeof(*s->quant_blocks));
     memset(s->factor_blocks, 0, needed_coeffs * sizeof(*s->factor_blocks));
     s->stats.block_jobs = needed_blocks;
@@ -1102,90 +1111,95 @@ static int dv_vk_get_plane_layout(enum AVPixelFormat fmt, int width, int height,
     return 0;
 }
 
-static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
+static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
 {
-    const int log2_blocksize = 3;
-    int       coeff_base     = 0;
-    int       mb_job_idx     = 0;
+    DVSubContext       *s             = avctx->internal->hwaccel_priv_data;
+    const DVwork_chunk *wc            = arg;
+    const int           chunk_index   = (int)(wc - s->work_chunks);
+    const int           log2_blocksize = 3;
+    const int           mb_base       = chunk_index * 5;
+    int                 coeff_base    = mb_base * s->sys->bpm;
+    const uint8_t      *buf_ptr       = &s->frame_packet[wc->buf_offset * 80];
 
-    for (int i = 0; i < s->stats.work_pool_size; i++) {
-        const DVwork_chunk *wc      = &s->work_chunks[i];
-        const uint8_t      *buf_ptr = &s->frame_packet[wc->buf_offset * 80];
+    for (int mb_index = 0; mb_index < 5; mb_index++) {
+        int           quant;
+        DVVkBlockInfo mb_data[DV_MAX_BPM];
+        uint8_t       mb_bit_buffer[80 + AV_INPUT_BUFFER_PADDING_SIZE] = {0};
+        PutBitContext pb;
+        GetBitContext gb;
+        int           is_field_mode = 0;
 
-        for (int mb_index = 0; mb_index < 5; mb_index++) {
-            int           quant;
-            DVVkBlockInfo mb_data[DV_MAX_BPM];
-            uint8_t       mb_bit_buffer[80 + AV_INPUT_BUFFER_PADDING_SIZE] = {0};
-            PutBitContext pb;
-            GetBitContext gb;
-            int           is_field_mode = 0;
+        quant = buf_ptr[3] & 0x0f;
+        buf_ptr += 4;
 
-            quant = buf_ptr[3] & 0x0f;
-            buf_ptr += 4;
+        init_put_bits(&pb, mb_bit_buffer, 80);
 
-            init_put_bits(&pb, mb_bit_buffer, 80);
+        for (int j = 0; j < s->sys->bpm; j++) {
+            DVVkBlockInfo *mb           = &mb_data[j];
+            int16_t       *block        = &s->coeff_blocks[(coeff_base + j) * 64];
+            int16_t       *quant_block  = &s->quant_blocks[(coeff_base + j) * 64];
+            uint32_t      *factor_block = &s->factor_blocks[(coeff_base + j) * 64];
+            int            last_index   = s->sys->block_sizes[j];
+            int            dc, dct_mode, class1;
 
-            for (int j = 0; j < s->sys->bpm; j++) {
-                DVVkBlockInfo *mb           = &mb_data[j];
-                int16_t       *block        = &s->coeff_blocks[(coeff_base + j) * 64];
-                int16_t       *quant_block  = &s->quant_blocks[(coeff_base + j) * 64];
-                uint32_t      *factor_block = &s->factor_blocks[(coeff_base + j) * 64];
-                int            last_index   = s->sys->block_sizes[j];
-                int            dc, dct_mode, class1;
+            init_get_bits(&gb, buf_ptr, last_index);
 
-                init_get_bits(&gb, buf_ptr, last_index);
+            dc       = get_sbits(&gb, 9);
+            dct_mode = get_bits1(&gb);
+            class1   = get_bits(&gb, 2);
 
-                dc       = get_sbits(&gb, 9);
-                dct_mode = get_bits1(&gb);
-                class1   = get_bits(&gb, 2);
-
-                if (DV_PROFILE_IS_HD(s->sys)) {
-                    mb->scan_table   = s->dv_zigzag[0];
-                    mb->factor_table = &s->idct_factor[(j >= 4) * 4 * 16 * 64 + class1 * 16 * 64 + quant * 64];
-                    is_field_mode |= (!j && dct_mode);
-                } else {
-                    mb->scan_table   = s->dv_zigzag[dct_mode && log2_blocksize == 3];
-                    mb->factor_table = &s->idct_factor[(class1 == 3) * 2 * 22 * 64 + (dct_mode && log2_blocksize == 3) * 22 * 64 +
-                                                       (quant + ff_dv_quant_offset[class1]) * 64];
-                }
-
-                dc                    = dc * 4 + 1024;
-                block[0]              = dc;
-                quant_block[0]        = dc;
-                factor_block[0]       = 1;
-                mb->pos               = 0;
-                mb->partial_bit_count = 0;
-
-                dv_vk_decode_ac(&gb, mb, block, quant_block, factor_block);
-
-                if (mb->pos >= 64)
-                    dv_vk_bit_copy(&pb, &gb);
-
-                buf_ptr += last_index >> 3;
+            if (DV_PROFILE_IS_HD(s->sys)) {
+                mb->scan_table   = s->dv_zigzag[0];
+                mb->factor_table = &s->idct_factor[(j >= 4) * 4 * 16 * 64 + class1 * 16 * 64 + quant * 64];
+                is_field_mode |= (!j && dct_mode);
+            } else {
+                mb->scan_table   = s->dv_zigzag[dct_mode && log2_blocksize == 3];
+                mb->factor_table =
+                    &s->idct_factor[(class1 == 3) * 2 * 22 * 64 + (dct_mode && log2_blocksize == 3) * 22 * 64 +
+                                    (quant + ff_dv_quant_offset[class1]) * 64];
             }
 
-            put_bits32(&pb, 0);
-            flush_put_bits(&pb);
+            dc                    = dc * 4 + 1024;
+            block[0]              = dc;
+            quant_block[0]        = dc;
+            factor_block[0]       = 1;
+            mb->pos               = 0;
+            mb->partial_bit_count = 0;
 
-            init_get_bits(&gb, mb_bit_buffer, put_bits_count(&pb));
-            for (int j = 0; j < s->sys->bpm; j++) {
-                DVVkBlockInfo *mb           = &mb_data[j];
-                int16_t       *block        = &s->coeff_blocks[(coeff_base + j) * 64];
-                int16_t       *quant_block  = &s->quant_blocks[(coeff_base + j) * 64];
-                uint32_t      *factor_block = &s->factor_blocks[(coeff_base + j) * 64];
+            dv_vk_decode_ac(&gb, mb, block, quant_block, factor_block);
 
-                if (mb->pos < 64 && get_bits_left(&gb) > 0)
-                    dv_vk_decode_ac(&gb, mb, block, quant_block, factor_block);
-            }
+            if (mb->pos >= 64)
+                dv_vk_bit_copy(&pb, &gb);
 
-            coeff_base += s->sys->bpm;
-            if (mb_job_idx < s->stats.mb_jobs)
-                s->mb_field_modes[mb_job_idx] = !!is_field_mode;
-            mb_job_idx++;
+            buf_ptr += last_index >> 3;
         }
+
+        put_bits32(&pb, 0);
+        flush_put_bits(&pb);
+
+        init_get_bits(&gb, mb_bit_buffer, put_bits_count(&pb));
+        for (int j = 0; j < s->sys->bpm; j++) {
+            DVVkBlockInfo *mb           = &mb_data[j];
+            int16_t       *block        = &s->coeff_blocks[(coeff_base + j) * 64];
+            int16_t       *quant_block  = &s->quant_blocks[(coeff_base + j) * 64];
+            uint32_t      *factor_block = &s->factor_blocks[(coeff_base + j) * 64];
+
+            if (mb->pos < 64 && get_bits_left(&gb) > 0)
+                dv_vk_decode_ac(&gb, mb, block, quant_block, factor_block);
+        }
+
+        s->mb_field_modes[mb_base + mb_index] = !!is_field_mode;
+        coeff_base += s->sys->bpm;
     }
 
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (raw coeffs for GPU dequant)\n", coeff_base);
+    return 0;
+}
+
+static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
+{
+    avctx->execute(avctx, dv_vk_decode_entropy_chunk, s->work_chunks, NULL, s->stats.work_pool_size, sizeof(DVwork_chunk));
+
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (raw coeffs for GPU dequant)\n", s->stats.block_jobs);
     s->coeff_blocks_are_spatial = 0;
 
     return 0;
@@ -1198,6 +1212,10 @@ static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
     size_t           num_coeffs;
     size_t           quant_bytes;
     size_t           factor_bytes;
+    size_t           idct_bytes;
+    FFVkBuffer      *out_buf;
+    size_t           out_bytes;
+    int              write_to_idct_buf;
     FFVkExecContext *exec;
 
     if (!s->dequant_gpu_ready) {
@@ -1212,6 +1230,10 @@ static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
     num_coeffs   = (size_t)num_blocks * 64;
     quant_bytes  = num_coeffs * sizeof(int32_t);
     factor_bytes = num_coeffs * sizeof(uint32_t);
+    idct_bytes   = (size_t)num_blocks * 128 * sizeof(int32_t);
+
+    write_to_idct_buf = s->idct_gpu_ready;
+    s->dequant_output_in_idct_buf = 0;
 
     if (quant_bytes > s->dequant_quant_buf_size) {
         if (s->dequant_quant_buf.buf) {
@@ -1255,28 +1277,57 @@ static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
         s->dequant_factor_buf_size = factor_bytes;
     }
 
-    if (quant_bytes > s->dequant_out_buf_size) {
-        if (s->dequant_out_buf.buf) {
-            if (s->dequant_out_buf_map) {
-                ff_vk_unmap_buffer(&s->vk, &s->dequant_out_buf, 0);
-                s->dequant_out_buf_map = NULL;
+    if (write_to_idct_buf) {
+        if (idct_bytes > s->idct_buf_size) {
+            if (s->idct_buf.buf) {
+                if (s->idct_buf_map) {
+                    ff_vk_unmap_buffer(&s->vk, &s->idct_buf, 0);
+                    s->idct_buf_map = NULL;
+                }
+                ff_vk_free_buf(&s->vk, &s->idct_buf);
             }
-            ff_vk_free_buf(&s->vk, &s->dequant_out_buf);
+
+            ret = ff_vk_create_buf(&s->vk, &s->idct_buf, idct_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (ret < 0)
+                goto fail;
+
+            ret = ff_vk_map_buffer(&s->vk, &s->idct_buf, (uint8_t **)&s->idct_buf_map, 0);
+            if (ret < 0)
+                goto fail;
+
+            s->idct_buf_size = idct_bytes;
         }
 
-        ret = ff_vk_create_buf(&s->vk, &s->dequant_out_buf, quant_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (ret < 0)
-            goto fail;
+        out_buf   = &s->idct_buf;
+        out_bytes = idct_bytes;
+    } else {
+        if (quant_bytes > s->dequant_out_buf_size) {
+            if (s->dequant_out_buf.buf) {
+                if (s->dequant_out_buf_map) {
+                    ff_vk_unmap_buffer(&s->vk, &s->dequant_out_buf, 0);
+                    s->dequant_out_buf_map = NULL;
+                }
+                ff_vk_free_buf(&s->vk, &s->dequant_out_buf);
+            }
 
-        ret = ff_vk_map_buffer(&s->vk, &s->dequant_out_buf, (uint8_t **)&s->dequant_out_buf_map, 0);
-        if (ret < 0)
-            goto fail;
+            ret = ff_vk_create_buf(&s->vk, &s->dequant_out_buf, quant_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (ret < 0)
+                goto fail;
 
-        s->dequant_out_buf_size = quant_bytes;
+            ret = ff_vk_map_buffer(&s->vk, &s->dequant_out_buf, (uint8_t **)&s->dequant_out_buf_map, 0);
+            if (ret < 0)
+                goto fail;
+
+            s->dequant_out_buf_size = quant_bytes;
+        }
+
+        out_buf   = &s->dequant_out_buf;
+        out_bytes = quant_bytes;
     }
 
-    if (!s->dequant_quant_buf_map || !s->dequant_factor_buf_map || !s->dequant_out_buf_map) {
+    if (!s->dequant_quant_buf_map || !s->dequant_factor_buf_map || !out_buf->buf) {
         ret = AVERROR_EXTERNAL;
         goto fail;
     }
@@ -1285,7 +1336,6 @@ static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
         s->dequant_quant_buf_map[i]  = s->quant_blocks[i];
         s->dequant_factor_buf_map[i] = s->factor_blocks[i];
     }
-    memset(s->dequant_out_buf_map, 0, quant_bytes);
 
     exec = ff_vk_exec_get(&s->vk, &s->idct_exec_pool);
     if (!exec) {
@@ -1307,7 +1357,7 @@ static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
     if (ret < 0)
         goto fail;
 
-    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 2, 0, &s->dequant_out_buf, 0, quant_bytes, VK_FORMAT_UNDEFINED);
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 2, 0, out_buf, 0, out_bytes, VK_FORMAT_UNDEFINED);
     if (ret < 0)
         goto fail;
 
@@ -1317,8 +1367,8 @@ static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
         DVVkDequantPush pd = {
             .num_coeffs   = (uint32_t)num_coeffs,
             .iweight_bits = (uint32_t)dv_vk_iweight_bits,
-            .reserved0    = 0,
-            .reserved1    = 0,
+            .output_stride = write_to_idct_buf ? 128u : 0u,
+            .output_base   = 0,
         };
 
         ff_vk_shader_update_push_const(&s->vk, exec, &s->dequant_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
@@ -1332,8 +1382,12 @@ static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
 
     ff_vk_exec_wait(&s->vk, exec);
 
-    for (size_t i = 0; i < num_coeffs; i++)
-        s->coeff_blocks[i] = (int16_t)s->dequant_out_buf_map[i];
+    if (!write_to_idct_buf) {
+        for (size_t i = 0; i < num_coeffs; i++)
+            s->coeff_blocks[i] = (int16_t)s->dequant_out_buf_map[i];
+    } else {
+        s->dequant_output_in_idct_buf = 1;
+    }
 
     av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: GPU dequant completed (%d blocks)\n", num_blocks);
 
@@ -1689,24 +1743,27 @@ static int dv_vk_stage_idct(AVCodecContext *avctx, DVSubContext *s)
             s->idct_buf_size = bytes;
         }
 
-        gpu_storage = s->idct_buf_map;
-        if (!gpu_storage) {
-            err = AVERROR_EXTERNAL;
-            goto gpu_fail;
-        }
-        for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
-            int storage_base = block_idx * 128;
-            int coeff_base   = block_idx * 64;
+        if (!s->dequant_output_in_idct_buf) {
+            gpu_storage = s->idct_buf_map;
+            if (!gpu_storage) {
+                err = AVERROR_EXTERNAL;
+                goto gpu_fail;
+            }
+            for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+                int storage_base = block_idx * 128;
+                int coeff_base   = block_idx * 64;
 
-            for (int i = 0; i < 64; i++)
-                gpu_storage[storage_base + i] = s->coeff_blocks[coeff_base + i];
+                for (int i = 0; i < 64; i++)
+                    gpu_storage[storage_base + i] = s->coeff_blocks[coeff_base + i];
 
-            memset(&gpu_storage[storage_base + 64], 0, 64 * sizeof(*gpu_storage));
+                memset(&gpu_storage[storage_base + 64], 0, 64 * sizeof(*gpu_storage));
+            }
         }
 
         if (s->recon_gpu_ready && dv_vk_recon_gpu_supported(s->sys)) {
             s->idct_upload_ready        = 1;
             s->coeff_blocks_are_spatial = 0;
+            s->dequant_output_in_idct_buf = 0;
             if (!atomic_exchange(&dv_vk_global_logged_idct_gpu_active, 1))
                 av_log(avctx, AV_LOG_INFO, "dv_vulkan: IDCT stage wired (GPU coeff upload for batched reconstruction)\n");
             av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: idct stage uploaded coeffs for GPU batched IDCT + reconstruction\n");
@@ -1867,7 +1924,7 @@ static int dv_vk_stage_color_convert(AVCodecContext *avctx, DVSubContext *s)
                 plane_bytes += (size_t)src_sizes[i];
         }
 
-        plane_bytes = FFALIGN(plane_bytes, 4) * sizeof(uint32_t);
+        plane_bytes = FFALIGN(plane_bytes, 4);
 
         if (job_bytes > s->recon_jobs_buf_size) {
             if (s->recon_jobs_buf.buf) {
@@ -1922,10 +1979,9 @@ static int dv_vk_stage_color_convert(AVCodecContext *avctx, DVSubContext *s)
 
                 for (uint32_t y = 0; y < (uint32_t)(src_sizes[plane] / src_linesizes[plane]); y++) {
                     const uint8_t *src_row = s->plane_staging + src_offsets[plane] + (ptrdiff_t)y * src_linesizes[plane];
-                    uint32_t      *dst_row = s->recon_plane_buf_map + src_offsets[plane] + y * (uint32_t)src_linesizes[plane];
+                    uint8_t       *dst_row = s->recon_plane_buf_map + src_offsets[plane] + y * (uint32_t)src_linesizes[plane];
 
-                    for (uint32_t x = 0; x < (uint32_t)src_linesizes[plane]; x++)
-                        dst_row[x] = src_row[x];
+                    memcpy(dst_row, src_row, (size_t)src_linesizes[plane]);
                 }
             }
         }
@@ -2468,7 +2524,7 @@ dequant_skip:
                 .name        = "plane_buffer",
                 .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
-                .buf_content = "uint data[];",
+                .buf_content = "uint8_t data[];",
             },
         };
         ff_vk_shader_add_descriptor_set(&s->vk, &s->recon_calc_shd, recon_calc_desc, 3, 0, 0);
@@ -2513,7 +2569,7 @@ dequant_skip:
                 .name        = "frame_buffer",
                 .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
-                .buf_content = "uint data[];",
+                .buf_content = "uint8_t data[];",
             },
             {
                 .name       = "output_img",
@@ -2739,6 +2795,8 @@ static int dv_vulkan_start_frame(AVCodecContext *avctx, const AVBufferRef *hw_fr
     if (ret < 0)
         return ret;
 
+    s->frame_packet_from_start = 1;
+
     return 0;
 }
 
@@ -2751,7 +2809,11 @@ static int dv_vulkan_decode_slice(AVCodecContext *avctx, const uint8_t *data, ui
 
     av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: decode_slice size=%u\n", size);
 
-    /* dvdec.c currently forwards the whole frame here; keep latest copy. */
+    if (s->frame_packet_from_start && s->frame_packet_size == size)
+        return 0;
+
+    /* Keep latest packet copy when decode_slice carries independent data. */
+    s->frame_packet_from_start = 0;
     return dv_vk_cache_packet(s, data, size);
 }
 

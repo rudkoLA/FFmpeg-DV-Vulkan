@@ -75,6 +75,7 @@ typedef struct DVDecContext {
     const AVDVProfile *sys;
     const AVFrame     *frame;
     const uint8_t     *buf;
+    enum AVPixelFormat selected_pix_fmt;
 
     uint8_t      dv_zigzag[2][64];
     DVwork_chunk work_chunks[4 * 12 * 27];
@@ -277,6 +278,8 @@ static av_cold int dvvideo_decode_init(AVCodecContext *avctx)
     s->idct_put[1] = ff_simple_idct248_put;
 
     ff_thread_once(&init_static_once, dv_init_static);
+
+    s->selected_pix_fmt = AV_PIX_FMT_NONE;
 
     return 0;
 }
@@ -658,14 +661,18 @@ static int dvvideo_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     s->frame            = frame;
 #if CONFIG_DV_VULKAN_HWACCEL
     {
-        enum AVPixelFormat pix_fmts[] = {
-            AV_PIX_FMT_VULKAN,
-            s->sys->pix_fmt,
-            AV_PIX_FMT_NONE
-        };
-        avctx->pix_fmt  = ff_get_format(avctx, pix_fmts);
-        if (avctx->pix_fmt == AV_PIX_FMT_NONE)
-            return AVERROR(EINVAL);
+        if (s->selected_pix_fmt == AV_PIX_FMT_NONE ||
+            (s->selected_pix_fmt != AV_PIX_FMT_VULKAN && s->selected_pix_fmt != s->sys->pix_fmt)) {
+            enum AVPixelFormat pix_fmts[] = {
+                AV_PIX_FMT_VULKAN,
+                s->sys->pix_fmt,
+                AV_PIX_FMT_NONE
+            };
+            s->selected_pix_fmt = ff_get_format(avctx, pix_fmts);
+            if (s->selected_pix_fmt == AV_PIX_FMT_NONE)
+                return AVERROR(EINVAL);
+        }
+        avctx->pix_fmt = s->selected_pix_fmt;
     }
 #else
     avctx->pix_fmt      = s->sys->pix_fmt;
