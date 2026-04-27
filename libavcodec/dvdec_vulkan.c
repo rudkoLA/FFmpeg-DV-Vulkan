@@ -446,7 +446,19 @@ static av_always_inline void dv_vk_decode_ac(GetBitContext *gb, DVVkBlockInfo *m
             if (factor_block)
                 factor_block[scan_idx] = factor_table[pos];
 
-            block[scan_idx] = raw_level;
+            if (quant_block || factor_block) {
+                block[scan_idx] = raw_level;
+            } else {
+                int64_t prod = (int64_t)raw_level * (int64_t)factor_table[pos];
+                int     deq;
+
+                if (prod >= 0)
+                    deq = (int)((prod + (1LL << (dv_vk_iweight_bits - 1))) >> dv_vk_iweight_bits);
+                else
+                    deq = -(int)(((-prod) + (1LL << (dv_vk_iweight_bits - 1))) >> dv_vk_iweight_bits);
+
+                block[scan_idx] = av_clip_int16(deq);
+            }
         }
 
         UPDATE_CACHE(re, gb);
@@ -971,23 +983,7 @@ static int dv_vk_prepare_coeff_staging(DVSubContext *s)
         s->coeff_blocks_alloc = needed_coeffs;
     }
 
-    if (needed_coeffs > s->dequant_blocks_alloc) {
-        int16_t *quant_tmp = av_realloc_array(s->quant_blocks, needed_coeffs, sizeof(*quant_tmp));
-        if (!quant_tmp)
-            return AVERROR(ENOMEM);
-        s->quant_blocks = quant_tmp;
-
-        uint32_t *factor_tmp = av_realloc_array(s->factor_blocks, needed_coeffs, sizeof(*factor_tmp));
-        if (!factor_tmp)
-            return AVERROR(ENOMEM);
-        s->factor_blocks = factor_tmp;
-
-        s->dequant_blocks_alloc = needed_coeffs;
-    }
-
     memset(s->coeff_blocks, 0, needed_coeffs * sizeof(*s->coeff_blocks));
-    memset(s->quant_blocks, 0, needed_coeffs * sizeof(*s->quant_blocks));
-    memset(s->factor_blocks, 0, needed_coeffs * sizeof(*s->factor_blocks));
     s->stats.block_jobs = needed_blocks;
 
     return 0;
@@ -1138,8 +1134,6 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
         for (int j = 0; j < s->sys->bpm; j++) {
             DVVkBlockInfo *mb           = &mb_data[j];
             int16_t       *block        = &s->coeff_blocks[(coeff_base + j) * 64];
-            int16_t       *quant_block  = &s->quant_blocks[(coeff_base + j) * 64];
-            uint32_t      *factor_block = &s->factor_blocks[(coeff_base + j) * 64];
             int            last_index   = s->sys->block_sizes[j];
             int            dc, dct_mode, class1;
 
@@ -1162,12 +1156,10 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
 
             dc                    = dc * 4 + 1024;
             block[0]              = dc;
-            quant_block[0]        = dc;
-            factor_block[0]       = 1;
             mb->pos               = 0;
             mb->partial_bit_count = 0;
 
-            dv_vk_decode_ac(&gb, mb, block, quant_block, factor_block);
+            dv_vk_decode_ac(&gb, mb, block, NULL, NULL);
 
             if (mb->pos >= 64)
                 dv_vk_bit_copy(&pb, &gb);
@@ -1180,13 +1172,11 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
 
         init_get_bits(&gb, mb_bit_buffer, put_bits_count(&pb));
         for (int j = 0; j < s->sys->bpm; j++) {
-            DVVkBlockInfo *mb           = &mb_data[j];
-            int16_t       *block        = &s->coeff_blocks[(coeff_base + j) * 64];
-            int16_t       *quant_block  = &s->quant_blocks[(coeff_base + j) * 64];
-            uint32_t      *factor_block = &s->factor_blocks[(coeff_base + j) * 64];
+            DVVkBlockInfo *mb    = &mb_data[j];
+            int16_t       *block = &s->coeff_blocks[(coeff_base + j) * 64];
 
             if (mb->pos < 64 && get_bits_left(&gb) > 0)
-                dv_vk_decode_ac(&gb, mb, block, quant_block, factor_block);
+                dv_vk_decode_ac(&gb, mb, block, NULL, NULL);
         }
 
         s->mb_field_modes[mb_base + mb_index] = !!is_field_mode;
@@ -1200,7 +1190,7 @@ static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
 {
     avctx->execute(avctx, dv_vk_decode_entropy_chunk, s->work_chunks, NULL, s->stats.work_pool_size, sizeof(DVwork_chunk));
 
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (raw coeffs for GPU dequant)\n", s->stats.block_jobs);
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (dequantized coeffs)\n", s->stats.block_jobs);
     s->coeff_blocks_are_spatial = 0;
 
     return 0;
@@ -1208,30 +1198,11 @@ static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
 
 static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
 {
-    int    num_blocks = s->stats.block_jobs;
-    size_t num_coeffs;
+    int num_blocks = s->stats.block_jobs;
 
-    if (num_blocks <= 0)
-        return 0;
-
-    num_coeffs = (size_t)num_blocks * 64;
     s->dequant_output_in_idct_buf = 0;
 
-    for (size_t i = 0; i < num_coeffs; i++) {
-        int q = s->quant_blocks[i];
-
-        if ((i & 63u) != 0u) {
-            int64_t prod = (int64_t)q * (int64_t)s->factor_blocks[i];
-            if (prod >= 0)
-                q = (int)((prod + (1LL << (dv_vk_iweight_bits - 1))) >> dv_vk_iweight_bits);
-            else
-                q = -(int)(((-prod) + (1LL << (dv_vk_iweight_bits - 1))) >> dv_vk_iweight_bits);
-        }
-
-        s->coeff_blocks[i] = av_clip_int16(q);
-    }
-
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU dequant completed (%d blocks)\n", num_blocks);
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: dequant stage skipped (already done in entropy decode, %d blocks)\n", num_blocks);
     return 0;
 }
 
@@ -1588,8 +1559,6 @@ static int dv_vk_stage_idct(AVCodecContext *avctx, DVSubContext *s)
 
                 for (int i = 0; i < 64; i++)
                     gpu_storage[storage_base + i] = s->coeff_blocks[coeff_base + i];
-
-                memset(&gpu_storage[storage_base + 64], 0, 64 * sizeof(*gpu_storage));
             }
         }
 
@@ -2017,8 +1986,6 @@ static int dv_vk_stage_color_convert(AVCodecContext *avctx, DVSubContext *s)
         ret = ff_vk_exec_submit(&s->vk, exec);
         if (ret < 0)
             goto gpu_recon_fail;
-
-        ff_vk_exec_wait(&s->vk, exec);
         s->idct_upload_ready = 0;
 
         s->cpu_output_required = 0;
@@ -2203,7 +2170,7 @@ static int dv_vulkan_decode_init(AVCodecContext *avctx)
         goto no_gpu;
     }
 
-    ret = ff_vk_exec_pool_init(&s->vk, qf, &s->idct_exec_pool, 1, 0, 0, 0, NULL);
+    ret = ff_vk_exec_pool_init(&s->vk, qf, &s->idct_exec_pool, 4, 0, 0, 0, NULL);
     if (ret < 0) {
         av_log(avctx, AV_LOG_WARNING, "dv_vulkan: exec pool init failed (%d), using CPU IDCT fallback\n", ret);
         goto no_gpu;
