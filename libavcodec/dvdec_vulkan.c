@@ -217,6 +217,7 @@ typedef struct DVVkBlockInfo {
 static enum AVPixelFormat dv_vk_choose_sw_format(enum AVPixelFormat sw_format);
 static int                dv_vk_recon_gpu_supported(const AVDVProfile *sys);
 static int                dv_vk_get_chroma_shifts(enum AVPixelFormat fmt, uint32_t *w_shift, uint32_t *h_shift, uint32_t *is_yuv411);
+static int                dv_vk_use_gpu_dequant(const DVSubContext *s);
 
 static const int dv_vk_iweight_bits = 14;
 
@@ -972,7 +973,7 @@ static int dv_vk_build_mb_jobs(AVCodecContext *avctx, DVSubContext *s)
 
 static int dv_vk_prepare_coeff_staging(DVSubContext *s)
 {
-    int needed_blocks = s->stats.mb_jobs * DV_MAX_BPM;
+    int needed_blocks = s->stats.mb_jobs * s->sys->bpm;
     int needed_coeffs = needed_blocks * 64;
 
     if (needed_coeffs > s->coeff_blocks_alloc) {
@@ -985,6 +986,21 @@ static int dv_vk_prepare_coeff_staging(DVSubContext *s)
 
     memset(s->coeff_blocks, 0, needed_coeffs * sizeof(*s->coeff_blocks));
     s->stats.block_jobs = needed_blocks;
+
+    if (dv_vk_use_gpu_dequant(s)) {
+        if (needed_coeffs > s->dequant_blocks_alloc) {
+            int16_t  *quant_tmp  = av_realloc_array(s->quant_blocks, needed_coeffs, sizeof(*s->quant_blocks));
+            uint32_t *factor_tmp = av_realloc_array(s->factor_blocks, needed_coeffs, sizeof(*s->factor_blocks));
+            if (!quant_tmp || !factor_tmp) {
+                av_freep(&quant_tmp);
+                av_freep(&factor_tmp);
+                return AVERROR(ENOMEM);
+            }
+            s->quant_blocks         = quant_tmp;
+            s->factor_blocks        = factor_tmp;
+            s->dequant_blocks_alloc = needed_coeffs;
+        }
+    }
 
     return 0;
 }
@@ -1024,8 +1040,6 @@ static int dv_vk_prepare_plane_staging(DVSubContext *s)
         s->plane_staging_size = total;
     }
 
-    memset(s->plane_staging, 0, total);
-
     return 0;
 }
 
@@ -1056,6 +1070,17 @@ static int dv_vk_recon_gpu_supported(const AVDVProfile *sys)
     default:
         return 0;
     }
+}
+
+static int dv_vk_use_gpu_dequant(const DVSubContext *s)
+{
+    if (!s || !s->sys)
+        return 0;
+
+    if (!s->dequant_gpu_ready || !s->idct_gpu_ready || !s->recon_gpu_ready)
+        return 0;
+
+    return dv_vk_recon_gpu_supported(s->sys);
 }
 
 static int dv_vk_get_chroma_shifts(enum AVPixelFormat fmt, uint32_t *w_shift, uint32_t *h_shift, uint32_t *is_yuv411)
@@ -1117,6 +1142,7 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
     const int           mb_base       = chunk_index * 5;
     int                 coeff_base    = mb_base * s->sys->bpm;
     const uint8_t      *buf_ptr       = &s->frame_packet[wc->buf_offset * 80];
+    const int           use_gpu_dequant = dv_vk_use_gpu_dequant(s);
 
     for (int mb_index = 0; mb_index < 5; mb_index++) {
         int           quant;
@@ -1133,7 +1159,9 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
 
         for (int j = 0; j < s->sys->bpm; j++) {
             DVVkBlockInfo *mb           = &mb_data[j];
-            int16_t       *block        = &s->coeff_blocks[(coeff_base + j) * 64];
+            int16_t       *block        = use_gpu_dequant ? &s->quant_blocks[(coeff_base + j) * 64]
+                                                         : &s->coeff_blocks[(coeff_base + j) * 64];
+            uint32_t      *factor_block = use_gpu_dequant ? &s->factor_blocks[(coeff_base + j) * 64] : NULL;
             int            last_index   = s->sys->block_sizes[j];
             int            dc, dct_mode, class1;
 
@@ -1159,7 +1187,10 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
             mb->pos               = 0;
             mb->partial_bit_count = 0;
 
-            dv_vk_decode_ac(&gb, mb, block, NULL, NULL);
+            if (factor_block)
+                factor_block[0] = 0;
+
+            dv_vk_decode_ac(&gb, mb, block, use_gpu_dequant ? block : NULL, factor_block);
 
             if (mb->pos >= 64)
                 dv_vk_bit_copy(&pb, &gb);
@@ -1173,10 +1204,12 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
         init_get_bits(&gb, mb_bit_buffer, put_bits_count(&pb));
         for (int j = 0; j < s->sys->bpm; j++) {
             DVVkBlockInfo *mb    = &mb_data[j];
-            int16_t       *block = &s->coeff_blocks[(coeff_base + j) * 64];
+            int16_t       *block = use_gpu_dequant ? &s->quant_blocks[(coeff_base + j) * 64]
+                                                   : &s->coeff_blocks[(coeff_base + j) * 64];
+            uint32_t      *factor_block = use_gpu_dequant ? &s->factor_blocks[(coeff_base + j) * 64] : NULL;
 
             if (mb->pos < 64 && get_bits_left(&gb) > 0)
-                dv_vk_decode_ac(&gb, mb, block, NULL, NULL);
+                dv_vk_decode_ac(&gb, mb, block, use_gpu_dequant ? block : NULL, factor_block);
         }
 
         s->mb_field_modes[mb_base + mb_index] = !!is_field_mode;
@@ -1190,7 +1223,11 @@ static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
 {
     avctx->execute(avctx, dv_vk_decode_entropy_chunk, s->work_chunks, NULL, s->stats.work_pool_size, sizeof(DVwork_chunk));
 
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (dequantized coeffs)\n", s->stats.block_jobs);
+    if (dv_vk_use_gpu_dequant(s)) {
+        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (quantized coeffs)\n", s->stats.block_jobs);
+    } else {
+        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (dequantized coeffs)\n", s->stats.block_jobs);
+    }
     s->coeff_blocks_are_spatial = 0;
 
     return 0;
@@ -1198,11 +1235,144 @@ static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
 
 static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
 {
-    int num_blocks = s->stats.block_jobs;
+    int             num_blocks = s->stats.block_jobs;
+    int             num_coeffs = num_blocks * 64;
+    size_t          quant_bytes;
+    size_t          factor_bytes;
+    size_t          idct_bytes;
+    FFVkExecContext *exec;
+    int             err;
 
     s->dequant_output_in_idct_buf = 0;
 
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: dequant stage skipped (already done in entropy decode, %d blocks)\n", num_blocks);
+    if (!dv_vk_use_gpu_dequant(s)) {
+        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: dequant stage skipped (already done in entropy decode, %d blocks)\n", num_blocks);
+        return 0;
+    }
+
+    if (num_blocks <= 0 || num_coeffs <= 0)
+        return 0;
+
+    quant_bytes  = (size_t)num_coeffs * sizeof(int32_t);
+    factor_bytes = (size_t)num_coeffs * sizeof(uint32_t);
+    idct_bytes   = (size_t)num_blocks * 128 * sizeof(int32_t);
+
+    if (quant_bytes > s->dequant_quant_buf_size) {
+        if (s->dequant_quant_buf.buf) {
+            if (s->dequant_quant_buf_map) {
+                ff_vk_unmap_buffer(&s->vk, &s->dequant_quant_buf, 0);
+                s->dequant_quant_buf_map = NULL;
+            }
+            ff_vk_free_buf(&s->vk, &s->dequant_quant_buf);
+        }
+
+        err = ff_vk_create_buf(&s->vk, &s->dequant_quant_buf, quant_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (err < 0)
+            return err;
+
+        err = ff_vk_map_buffer(&s->vk, &s->dequant_quant_buf, (uint8_t **)&s->dequant_quant_buf_map, 0);
+        if (err < 0)
+            return err;
+
+        s->dequant_quant_buf_size = quant_bytes;
+    }
+
+    if (factor_bytes > s->dequant_factor_buf_size) {
+        if (s->dequant_factor_buf.buf) {
+            if (s->dequant_factor_buf_map) {
+                ff_vk_unmap_buffer(&s->vk, &s->dequant_factor_buf, 0);
+                s->dequant_factor_buf_map = NULL;
+            }
+            ff_vk_free_buf(&s->vk, &s->dequant_factor_buf);
+        }
+
+        err = ff_vk_create_buf(&s->vk, &s->dequant_factor_buf, factor_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (err < 0)
+            return err;
+
+        err = ff_vk_map_buffer(&s->vk, &s->dequant_factor_buf, (uint8_t **)&s->dequant_factor_buf_map, 0);
+        if (err < 0)
+            return err;
+
+        s->dequant_factor_buf_size = factor_bytes;
+    }
+
+    if (idct_bytes > s->idct_buf_size) {
+        if (s->idct_buf.buf) {
+            if (s->idct_buf_map) {
+                ff_vk_unmap_buffer(&s->vk, &s->idct_buf, 0);
+                s->idct_buf_map = NULL;
+            }
+            ff_vk_free_buf(&s->vk, &s->idct_buf);
+        }
+
+        err = ff_vk_create_buf(&s->vk, &s->idct_buf, idct_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (err < 0)
+            return err;
+
+        err = ff_vk_map_buffer(&s->vk, &s->idct_buf, (uint8_t **)&s->idct_buf_map, 0);
+        if (err < 0)
+            return err;
+
+        s->idct_buf_size = idct_bytes;
+    }
+
+    if (!s->dequant_quant_buf_map || !s->dequant_factor_buf_map)
+        return AVERROR_EXTERNAL;
+
+    for (int i = 0; i < num_coeffs; i++)
+        s->dequant_quant_buf_map[i] = s->quant_blocks[i];
+
+    memcpy(s->dequant_factor_buf_map, s->factor_blocks, factor_bytes);
+
+    exec = ff_vk_exec_get(&s->vk, &s->idct_exec_pool);
+    if (!exec)
+        return AVERROR_EXTERNAL;
+
+    err = ff_vk_exec_start(&s->vk, exec);
+    if (err < 0)
+        return err;
+
+    err = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 0, 0, &s->dequant_quant_buf, 0, quant_bytes,
+                                          VK_FORMAT_UNDEFINED);
+    if (err < 0)
+        return err;
+
+    err = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 1, 0, &s->dequant_factor_buf, 0, factor_bytes,
+                                          VK_FORMAT_UNDEFINED);
+    if (err < 0)
+        return err;
+
+    err = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 2, 0, &s->idct_buf, 0, idct_bytes,
+                                          VK_FORMAT_UNDEFINED);
+    if (err < 0)
+        return err;
+
+    ff_vk_exec_bind_shader(&s->vk, exec, &s->dequant_shd);
+
+    {
+        DVVkDequantPush pd = {
+            .num_coeffs    = (uint32_t)num_coeffs,
+            .iweight_bits  = (uint32_t)dv_vk_iweight_bits,
+            .output_stride = 128,
+            .output_base   = 0,
+        };
+
+        ff_vk_shader_update_push_const(&s->vk, exec, &s->dequant_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
+    }
+
+    s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)((num_coeffs + 63) / 64), 1, 1);
+
+    err = ff_vk_exec_submit(&s->vk, exec);
+    if (err < 0)
+        return err;
+
+    ff_vk_exec_wait(&s->vk, exec);
+
+    s->dequant_output_in_idct_buf = 1;
     return 0;
 }
 
@@ -1363,7 +1533,6 @@ static int dv_vk_stage_cpu_reconstruct_yuv(AVCodecContext *avctx, DVSubContext *
             s->decode_plane_staging_size = needed;
         }
 
-        memset(s->decode_plane_staging, 0, needed);
         for (int i = 0; i < 4; i++) {
             if (dec_plane_sizes[i] <= 0)
                 continue;
@@ -1774,7 +1943,6 @@ static int dv_vk_stage_color_convert(AVCodecContext *avctx, DVSubContext *s)
                 goto gpu_recon_fail;
             }
 
-            memset(s->recon_plane_buf_map, 0, s->recon_plane_buf_size);
             for (int plane = 0; plane < 4; plane++) {
                 if (src_sizes[plane] <= 0 || src_linesizes[plane] <= 0)
                     continue;
@@ -1783,8 +1951,7 @@ static int dv_vk_stage_color_convert(AVCodecContext *avctx, DVSubContext *s)
                     const uint8_t *src_row = s->plane_staging + src_offsets[plane] + (ptrdiff_t)y * src_linesizes[plane];
                     uint32_t      *dst_row = s->recon_plane_buf_map + src_offsets[plane] + y * (uint32_t)src_linesizes[plane];
 
-                    for (uint32_t x = 0; x < (uint32_t)src_linesizes[plane]; x++)
-                        dst_row[x] = src_row[x];
+                    memcpy(dst_row, src_row, (size_t)src_linesizes[plane]);
                 }
             }
         }
