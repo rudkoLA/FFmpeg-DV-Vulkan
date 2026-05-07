@@ -25,6 +25,7 @@
 
 #define FF_INTERNAL_FIELDS
 
+#include <inttypes.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -57,10 +58,18 @@
 #include "mathops.h"
 #include "put_bits.h"
 #include "simple_idct.h"
-#include "libswscale/swscale.h"
 #include "vlc.h"
 
-#define DV_MAX_WORK_CHUNKS (4 * 12 * 27)
+#define DV_MAX_WORK_CHUNKS         (4 * 12 * 27)
+#define DV_VK_MAX_INFLIGHT_FRAMES 4
+#define DV_VK_MAX_MB_JOBS         (DV_MAX_WORK_CHUNKS * 5)
+#define DV_VK_MAX_BLOCKS          (DV_VK_MAX_MB_JOBS * DV_MAX_BPM)
+#define DV_VK_MAX_COEFFS          (DV_VK_MAX_BLOCKS * 64)
+#define DV_VK_MAX_IDCT_BYTES      ((size_t)DV_VK_MAX_BLOCKS * 128 * sizeof(int32_t))
+#define DV_VK_SD_PLANE_BYTES      ((size_t)720 * 480 * 2)
+#define DV_VK_HD_PLANE_BYTES      ((size_t)1920 * 1088 * 3)
+#define DV_VK_MAX_PLANE_BYTES     DV_VK_HD_PLANE_BYTES
+#define DV_VK_MAX_META_BYTES      ((size_t)DV_VK_MAX_BLOCKS * sizeof(uint32_t) * 2)
 
 typedef struct DVMacroblockJob {
     uint16_t buf_offset;
@@ -81,6 +90,42 @@ typedef struct DVPipelineStats {
     enum AVPixelFormat sw_format;
 } DVPipelineStats;
 
+typedef struct DVVkReconJob {
+    uint32_t mb_x;
+    uint32_t mb_y;
+    uint32_t field_mode;
+    uint32_t reserved;
+} DVVkReconJob;
+
+typedef struct DVVkSparseCoeff {
+    uint16_t idx;
+    int16_t  value;
+} DVVkSparseCoeff;
+
+typedef struct DVVkSparseBlock {
+    uint32_t        count;
+    DVVkSparseCoeff coeffs[16];
+} DVVkSparseBlock;
+
+typedef struct DVVkFrameSlot {
+    FFVkBuffer quant_dev;
+    FFVkBuffer dequant_meta_dev;
+    FFVkBuffer idct_dev;
+    FFVkBuffer recon_jobs_dev;
+    FFVkBuffer recon_plane_dev;
+    size_t     recon_plane_size;
+
+    FFVkBuffer quant_stage;
+    FFVkBuffer dequant_meta_stage;
+    FFVkBuffer recon_jobs_stage;
+
+    DVVkSparseBlock *quant_stage_map;
+    uint32_t     *dequant_meta_stage_map;
+    DVVkReconJob *recon_jobs_stage_map;
+
+    uint64_t completed_value;
+} DVVkFrameSlot;
+
 typedef struct DVSubContext {
     const AVDVProfile *sys;
 
@@ -100,34 +145,21 @@ typedef struct DVSubContext {
 
     int16_t  *coeff_blocks;
     int       coeff_blocks_alloc;
-    int16_t  *quant_blocks;
-    uint32_t *factor_blocks;
+    DVVkSparseBlock *quant_blocks;
+    uint32_t *dequant_meta_blocks;
     int       dequant_blocks_alloc;
 
     FFVulkanContext vk;
     FFVkExecPool    idct_exec_pool;
+    FFVkExecPool    transfer_pool;
+    AVVulkanDeviceQueueFamily *transfer_qf;
     FFVulkanShader  dequant_shd;
     FFVulkanShader  idct_shd;
     FFVulkanShader  recon_calc_shd;
     FFVulkanShader  recon_shd;
-    FFVkBuffer      dequant_quant_buf;
-    size_t          dequant_quant_buf_size;
-    int32_t        *dequant_quant_buf_map;
-    FFVkBuffer      dequant_factor_buf;
-    size_t          dequant_factor_buf_size;
-    uint32_t       *dequant_factor_buf_map;
-    FFVkBuffer      dequant_out_buf;
-    size_t          dequant_out_buf_size;
-    int32_t        *dequant_out_buf_map;
-    FFVkBuffer      idct_buf;
-    size_t          idct_buf_size;
-    int32_t        *idct_buf_map;
-    FFVkBuffer      recon_jobs_buf;
-    size_t          recon_jobs_buf_size;
-    uint8_t        *recon_jobs_buf_map;
-    FFVkBuffer      recon_plane_buf;
-    size_t          recon_plane_buf_size;
-    uint32_t       *recon_plane_buf_map;
+    FFVkBuffer      factor_tables_dev;
+    FFVkBuffer      inv_scan_dev;
+    int             gpu_table_profile_key;
     int             dequant_gpu_ready;
     int             idct_gpu_ready;
     int             recon_gpu_ready;
@@ -135,18 +167,17 @@ typedef struct DVSubContext {
     int             logged_idct_gpu_fail;
     int             logged_recon_gpu_fail;
 
-    uint8_t *plane_staging;
-    int      plane_staging_size;
-    uint8_t *decode_plane_staging;
-    int      decode_plane_staging_size;
     int      coeff_blocks_are_spatial;
     int      idct_upload_ready;
-    int      cpu_output_required;
     int      dequant_output_in_idct_buf;
 
     DVPipelineStats stats;
 
-    int logged_idct_fallback;
+    DVVkFrameSlot frame_slots[DV_VK_MAX_INFLIGHT_FRAMES];
+    VkSemaphore   frame_timeline_sem;
+    uint64_t      next_timeline_value;
+    int           next_frame_slot;
+    int           active_frame_slot;
 } DVSubContext;
 
 /*
@@ -167,18 +198,14 @@ typedef struct DVVkIDCTPush {
 } DVVkIDCTPush;
 
 typedef struct DVVkDequantPush {
-    uint32_t num_coeffs;
+    uint32_t num_blocks;
     uint32_t iweight_bits;
     uint32_t output_stride;
     uint32_t output_base;
 } DVVkDequantPush;
 
-typedef struct DVVkReconJob {
-    uint32_t mb_x;
-    uint32_t mb_y;
-    uint32_t field_mode;
-    uint32_t reserved;
-} DVVkReconJob;
+#define DV_VK_MAX_JOBS_BYTES ((size_t)DV_VK_MAX_MB_JOBS * sizeof(DVVkReconJob))
+#define DV_VK_MAX_SPARSE_BYTES ((size_t)DV_VK_MAX_BLOCKS * sizeof(DVVkSparseBlock))
 
 typedef struct DVVkReconCalcPush {
     uint32_t width[4];
@@ -218,6 +245,7 @@ static enum AVPixelFormat dv_vk_choose_sw_format(enum AVPixelFormat sw_format);
 static int                dv_vk_recon_gpu_supported(const AVDVProfile *sys);
 static int                dv_vk_get_chroma_shifts(enum AVPixelFormat fmt, uint32_t *w_shift, uint32_t *h_shift, uint32_t *is_yuv411);
 static int                dv_vk_use_gpu_dequant(const DVSubContext *s);
+static int                dv_vulkan_decode_uninit(AVCodecContext *avctx);
 
 static const int dv_vk_iweight_bits = 14;
 
@@ -260,10 +288,7 @@ static const uint16_t dv_vk_iweight_720_c[64] = {
 
 static RL_VLC_ELEM dv_vk_rl_vlc[1664];
 static AVOnce      dv_vk_rl_vlc_once                    = AV_ONCE_INIT;
-static atomic_int  dv_vk_global_disable_gpu_idct        = 0;
-static atomic_int  dv_vk_global_logged_idct_fallback    = 0;
 static atomic_int  dv_vk_global_logged_dequant_gpu_init = 0;
-static atomic_int  dv_vk_global_logged_idct_gpu_active  = 0;
 static atomic_int  dv_vk_global_logged_idct_gpu_init    = 0;
 static atomic_int  dv_vk_global_logged_recon_gpu_init   = 0;
 
@@ -397,7 +422,7 @@ static void dv_vk_init_weight_tables(DVSubContext *s, const AVDVProfile *d)
     }
 }
 
-static av_always_inline void dv_vk_decode_ac(GetBitContext *gb, DVVkBlockInfo *mb, int16_t *block, int16_t *quant_block,
+static av_always_inline void dv_vk_decode_ac(GetBitContext *gb, DVVkBlockInfo *mb, int16_t *block, DVVkSparseBlock *sparse_block,
                                              uint32_t *factor_block)
 {
     int             last_index        = gb->size_in_bits;
@@ -442,12 +467,17 @@ static av_always_inline void dv_vk_decode_ac(GetBitContext *gb, DVVkBlockInfo *m
             int scan_idx  = scan_table[pos];
             int raw_level = level;
 
-            if (quant_block)
-                quant_block[scan_idx] = raw_level;
+            if (sparse_block) {
+                if (sparse_block->count < 16) {
+                    sparse_block->coeffs[sparse_block->count].idx   = (uint16_t)scan_idx;
+                    sparse_block->coeffs[sparse_block->count].value = (int16_t)raw_level;
+                    sparse_block->count++;
+                }
+            }
             if (factor_block)
                 factor_block[scan_idx] = factor_table[pos];
 
-            if (quant_block || factor_block) {
+            if (sparse_block || factor_block) {
                 block[scan_idx] = raw_level;
             } else {
                 int64_t prod = (int64_t)raw_level * (int64_t)factor_table[pos];
@@ -483,28 +513,38 @@ static void dv_vk_build_dequant_shader_source(FFVulkanShader *shd)
 {
     GLSLC(
         0, layout(push_constant) uniform PushConstants {                     );
-            GLSLC(1, uint num_coeffs;);
+            GLSLC(1, uint num_blocks;);
             GLSLC(1, uint iweight_bits;);
             GLSLC(1, uint output_stride;);
             GLSLC(1, uint output_base;);
     GLSLC(0,
         } pc;);
+
     GLSLC(
         0, void main() {                                                     );
-            GLSLC(1, uint idx = gl_GlobalInvocationID.x;);
-            GLSLC(1, if (idx >= pc.num_coeffs));
+            GLSLC(1, uint block_base = gl_WorkGroupID.x * 4u;);
+            GLSLC(1, uint block_in_wg = gl_LocalInvocationID.x >> 3u;);
+            GLSLC(1, uint block = block_base + block_in_wg;);
+            GLSLC(1, if (block >= pc.num_blocks));
             GLSLC(2, return;);
-            GLSLC(1, int q = quantized[idx];);
-            GLSLC(1, int value = q;);
-            GLSLC(1, if ((idx & 63u) != 0u));
-            GLSLC(2, value = int((uint(q) * factors[idx] + (1u << (pc.iweight_bits - 1u))) >> pc.iweight_bits););
-            GLSLC(1, uint out_idx = idx;);
-            GLSLC(1, if (pc.output_stride != 0u) {);
-                GLSLC(2, uint block = idx >> 6u;);
-                GLSLC(2, uint coeff = idx & 63u;);
-                GLSLC(2, out_idx = pc.output_base + block * pc.output_stride + coeff;);
+            GLSLC(1, uint t_idx = gl_LocalInvocationID.y * 8u + (gl_LocalInvocationID.x & 7u););
+            GLSLC(1, uint base = pc.output_base + block * pc.output_stride;);
+            GLSLC(1, dequantized[base + t_idx] = 0;);
+            GLSLC(1, barrier(););
+            GLSLC(1, uint count = blocks[block * 17u];);
+            GLSLC(1, if (t_idx < count) {);
+            GLSLC(2, uint c = blocks[block * 17u + 1u + t_idx];);
+            GLSLC(2, uint coeff = c & 0xFFFFu;);
+            GLSLC(2, int q = (int(c) >> 16););
+            GLSLC(2, int value = q;);
+            GLSLC(2, uvec2 block_meta = meta[block];);
+            GLSLC(2, if (coeff != 0u) {);
+            GLSLC(3, uint scan_pos = inv_scan[(block_meta.y << 6u) + coeff];);
+            GLSLC(3, uint factor = factors[block_meta.x + scan_pos];);
+            GLSLC(3, value = (q * int(factor) + (1 << (pc.iweight_bits - 1))) >> pc.iweight_bits;);
+            GLSLC(2, });
+            GLSLC(2, dequantized[base + coeff] = value;);
             GLSLC(1, });
-            GLSLC(1, dequantized[out_idx] = value;);
     GLSLC(0,
         });
 }
@@ -695,17 +735,149 @@ static void dv_vk_build_recon_calc_shader_source(FFVulkanShader *shd)
     GLSLC(0,
         };);
 
+    GLSLC(0, shared int intermediate[64];);
+    GLSLC(0, const int W1 = 22725;);
+    GLSLC(0, const int W2 = 21407;);
+    GLSLC(0, const int W3 = 19266;);
+    GLSLC(0, const int W4 = 16383;);
+    GLSLC(0, const int W5 = 12873;);
+    GLSLC(0, const int W6 = 8867;);
+    GLSLC(0, const int W7 = 4520;);
+    GLSLC(0, const int ROW_SHIFT = 11;);
+    GLSLC(0, const int COL_SHIFT = 20;);
+    GLSLC(0, const int COL_BIAS_DIV_W4 = ((1 << (COL_SHIFT - 1)) / W4););
+
     GLSLC(
-        0, uint load_sample(uint block_idx, uint x, uint y) {      );
-            GLSLC(1, uint idx = block_idx * 128u + 64u + y * 8u + x;);
-            GLSLC(1, int value = values[idx];);
+        0, int idct_row_element(in int row[8], uint out_idx) {               );
+            GLSLC(1, int a0 = W4 * row[0] + (1 << (ROW_SHIFT - 1)););
+            GLSLC(1, int a1 = a0;);
+            GLSLC(1, int a2 = a0;);
+            GLSLC(1, int a3 = a0;);
+            GLSLC(1, a0 += W2 * row[2];);
+            GLSLC(1, a1 += W6 * row[2];);
+            GLSLC(1, a2 += -W6 * row[2];);
+            GLSLC(1, a3 += -W2 * row[2];);
+            GLSLC(1, int b0 = W1 * row[1];);
+            GLSLC(1, b0 += W3 * row[3];);
+            GLSLC(1, int b1 = W3 * row[1];);
+            GLSLC(1, b1 += -W7 * row[3];);
+            GLSLC(1, int b2 = W5 * row[1];);
+            GLSLC(1, b2 += -W1 * row[3];);
+            GLSLC(1, int b3 = W7 * row[1];);
+            GLSLC(1, b3 += -W5 * row[3];);
+            GLSLC(
+                1, if ((row[4] | row[5] | row[6] | row[7]) != 0) {);
+                    GLSLC(2, a0 += W4 * row[4];);
+                    GLSLC(2, a0 += W6 * row[6];);
+                    GLSLC(2, a1 += -W4 * row[4];);
+                    GLSLC(2, a1 += -W2 * row[6];);
+                    GLSLC(2, a2 += -W4 * row[4];);
+                    GLSLC(2, a2 += W2 * row[6];);
+                    GLSLC(2, a3 += W4 * row[4];);
+                    GLSLC(2, a3 += -W6 * row[6];);
+                    GLSLC(2, b0 += W5 * row[5];);
+                    GLSLC(2, b0 += W7 * row[7];);
+                    GLSLC(2, b1 += -W1 * row[5];);
+                    GLSLC(2, b1 += -W5 * row[7];);
+                    GLSLC(2, b2 += W7 * row[5];);
+                    GLSLC(2, b2 += W3 * row[7];);
+                    GLSLC(2, b3 += W3 * row[5];);
+                    GLSLC(2, b3 += -W1 * row[7];);
+            GLSLC(1,
+                });
+            GLSLC(1, int r0 = (a0 + b0) >> ROW_SHIFT;);
+            GLSLC(1, int r1 = (a1 + b1) >> ROW_SHIFT;);
+            GLSLC(1, int r2 = (a2 + b2) >> ROW_SHIFT;);
+            GLSLC(1, int r3 = (a3 + b3) >> ROW_SHIFT;);
+            GLSLC(1, int r4 = (a3 - b3) >> ROW_SHIFT;);
+            GLSLC(1, int r5 = (a2 - b2) >> ROW_SHIFT;);
+            GLSLC(1, int r6 = (a1 - b1) >> ROW_SHIFT;);
+            GLSLC(1, int r7 = (a0 - b0) >> ROW_SHIFT;);
+            GLSLC(1, if (out_idx == 0u) return r0;);
+            GLSLC(1, if (out_idx == 1u) return r1;);
+            GLSLC(1, if (out_idx == 2u) return r2;);
+            GLSLC(1, if (out_idx == 3u) return r3;);
+            GLSLC(1, if (out_idx == 4u) return r4;);
+            GLSLC(1, if (out_idx == 5u) return r5;);
+            GLSLC(1, if (out_idx == 6u) return r6;);
+            GLSLC(1, return r7;);
+    GLSLC(0,
+        });
+
+    GLSLC(
+        0, int idct_col_element(in int col[8], uint out_idx) {               );
+            GLSLC(1, int a0 = W4 * (col[0] + COL_BIAS_DIV_W4););
+            GLSLC(1, int a1 = a0;);
+            GLSLC(1, int a2 = a0;);
+            GLSLC(1, int a3 = a0;);
+            GLSLC(1, a0 += W2 * col[2];);
+            GLSLC(1, a1 += W6 * col[2];);
+            GLSLC(1, a2 += -W6 * col[2];);
+            GLSLC(1, a3 += -W2 * col[2];);
+            GLSLC(1, int b0 = W1 * col[1];);
+            GLSLC(1, b0 += W3 * col[3];);
+            GLSLC(1, int b1 = W3 * col[1];);
+            GLSLC(1, b1 += -W7 * col[3];);
+            GLSLC(1, int b2 = W5 * col[1];);
+            GLSLC(1, b2 += -W1 * col[3];);
+            GLSLC(1, int b3 = W7 * col[1];);
+            GLSLC(1, b3 += -W5 * col[3];);
+            GLSLC(1, if (col[4] != 0) { a0 += W4 * col[4]; a1 += -W4 * col[4]; a2 += -W4 * col[4]; a3 += W4 * col[4]; });
+            GLSLC(1, if (col[5] != 0) { b0 += W5 * col[5]; b1 += -W1 * col[5]; b2 += W7 * col[5]; b3 += W3 * col[5]; });
+            GLSLC(1, if (col[6] != 0) { a0 += W6 * col[6]; a1 += -W2 * col[6]; a2 += W2 * col[6]; a3 += -W6 * col[6]; });
+            GLSLC(1, if (col[7] != 0) { b0 += W7 * col[7]; b1 += -W5 * col[7]; b2 += W3 * col[7]; b3 += -W1 * col[7]; });
+            GLSLC(1, int r0 = (a0 + b0) >> COL_SHIFT;);
+            GLSLC(1, int r1 = (a1 + b1) >> COL_SHIFT;);
+            GLSLC(1, int r2 = (a2 + b2) >> COL_SHIFT;);
+            GLSLC(1, int r3 = (a3 + b3) >> COL_SHIFT;);
+            GLSLC(1, int r4 = (a3 - b3) >> COL_SHIFT;);
+            GLSLC(1, int r5 = (a2 - b2) >> COL_SHIFT;);
+            GLSLC(1, int r6 = (a1 - b1) >> COL_SHIFT;);
+            GLSLC(1, int r7 = (a0 - b0) >> COL_SHIFT;);
+            GLSLC(1, if (out_idx == 0u) return r0;);
+            GLSLC(1, if (out_idx == 1u) return r1;);
+            GLSLC(1, if (out_idx == 2u) return r2;);
+            GLSLC(1, if (out_idx == 3u) return r3;);
+            GLSLC(1, if (out_idx == 4u) return r4;);
+            GLSLC(1, if (out_idx == 5u) return r5;);
+            GLSLC(1, if (out_idx == 6u) return r6;);
+            GLSLC(1, return r7;);
+    GLSLC(0,
+        });
+
+    GLSLC(
+        0, int load_sample(uint block_idx, uint x, uint y) {      );
+            GLSLC(1, return values[block_idx * 128u + y * 8u + x];);
+    GLSLC(0,
+        });
+
+    GLSLC(
+        0, uint spatial_sample(uint block_idx, uint x, uint y) {       );
+            GLSLC(1, int row_in[8];);
+            GLSLC(1, for (int i = 0; i < 8; ++i));
+            GLSLC(2, row_in[i] = load_sample(block_idx, uint(i), y););
+            GLSLC(1, intermediate[y * 8u + x] = idct_row_element(row_in, x););
+            GLSLC(1, barrier(););
+            GLSLC(1, int col_in[8];);
+            GLSLC(1, for (int i = 0; i < 8; ++i));
+            GLSLC(2, col_in[i] = intermediate[i * 8u + x];);
+            GLSLC(1, int value = idct_col_element(col_in, y););
+            GLSLC(1, values[block_idx * 128u + 64u + y * 8u + x] = value;);
             GLSLC(1, return uint(clamp(value, 0, 255)););
     GLSLC(0,
         });
 
     GLSLC(
         0, void store_byte(uint idx, uint value) {                  );
-            GLSLC(1, data[idx] = value & 255u;);
+            GLSLC(1, uint word_idx = idx >> 2u;);
+            GLSLC(1, uint shift = (idx & 3u) << 3u;);
+            GLSLC(1, uint mask = 255u << shift;);
+            GLSLC(1, uint old_value = data[word_idx];);
+            GLSLC(1, uint expected;);
+            GLSLC(1, do {);
+            GLSLC(2, expected = old_value;);
+            GLSLC(2, old_value = atomicCompSwap(data[word_idx], expected, (expected & ~mask) | ((value & 255u) << shift)););
+            GLSLC(1, } while (old_value != expected););
     GLSLC(0,
         });
 
@@ -726,6 +898,7 @@ static void dv_vk_build_recon_calc_shader_source(FFVulkanShader *shd)
             GLSLC(1, uint sample_y = gl_LocalInvocationID.y;);
             GLSLC(1, if (sample_x >= 8u || sample_y >= 8u));
             GLSLC(2, return;);
+            GLSLC(1, uint value = spatial_sample(block_idx, sample_x, sample_y););
             GLSLC(1, uint linesize_y = plane_stride[0] << is_field_mode;);
             GLSLC(1, uint y_ptr = plane_offset[0] + ((mb_y * plane_stride[0] + mb_x) << 3u););
             GLSLC(1, uint y_stride = 2u << 3u;);
@@ -741,7 +914,7 @@ static void dv_vk_build_recon_calc_shader_source(FFVulkanShader *shd)
                 1,
                 if (block_in_mb < 4u) {);
                     GLSLC(2, uint base = y_ptr + ((block_in_mb & 1u) * 8u) + ((block_in_mb >> 1u) * y_stride););
-                    GLSLC(2, store_byte(base + sample_y * linesize_y + sample_x, load_sample(block_idx, sample_x, sample_y)););
+                    GLSLC(2, store_byte(base + sample_y * linesize_y + sample_x, value););
             GLSLC(1,
                 } else {);
                     GLSLC(2, uint plane = 0u;);
@@ -761,14 +934,10 @@ static void dv_vk_build_recon_calc_shader_source(FFVulkanShader *shd)
                     GLSLC(
                         2,
                         if (is_yuv411 != 0u && mb_x >= chroma_411_split_mb_x) {);
-                            GLSLC(
-                                3, if (sample_x < 4u) {);
-                                    GLSLC(4, store_byte(base + sample_y * chroma_stride + sample_x,
-                                                        load_sample(block_idx, sample_x, sample_y)););
-                                    GLSLC(4, store_byte(base + (chroma_stride << 3u) + sample_y * chroma_stride + sample_x,
-                                                        load_sample(block_idx, sample_x + 4u, sample_y)););
-            GLSLC(3,
-                                });
+                            GLSLC(3, if (sample_x < 4u));
+                            GLSLC(4, store_byte(base + sample_y * chroma_stride + sample_x, value););
+                            GLSLC(3, else);
+                            GLSLC(4, store_byte(base + (chroma_stride << 3u) + sample_y * chroma_stride + (sample_x - 4u), value););
             GLSLC(2,
                         } else {);
                             GLSLC(
@@ -779,7 +948,7 @@ static void dv_vk_build_recon_calc_shader_source(FFVulkanShader *shd)
                                     GLSLC(4, base += chroma_y_stride;);
                             GLSLC(3,
                                 });
-                            GLSLC(3, store_byte(base + sample_y * chroma_stride + sample_x, load_sample(block_idx, sample_x, sample_y)););
+                            GLSLC(3, store_byte(base + sample_y * chroma_stride + sample_x, value););
             GLSLC(2,
                         });
             GLSLC(1,
@@ -806,7 +975,9 @@ static void dv_vk_build_recon_shader_source(FFVulkanShader *shd)
 
     GLSLC(
         0, uint load_byte(uint idx) {                                );
-            GLSLC(1, return uint(data[idx]););
+            GLSLC(1, uint word = data[idx >> 2u];);
+            GLSLC(1, uint shift = (idx & 3u) << 3u;);
+            GLSLC(1, return (word >> shift) & 255u;);
     GLSLC(0,
         });
 
@@ -863,13 +1034,225 @@ static void dv_vk_build_recon_shader_source(FFVulkanShader *shd)
 
 static void dv_vk_reset_frame_state(DVSubContext *s)
 {
-    s->frame_packet_size        = 0;
-    s->frame_packet_from_start  = 0;
-    s->stats                    = (DVPipelineStats){0};
-    s->coeff_blocks_are_spatial = 0;
-    s->idct_upload_ready        = 0;
-    s->cpu_output_required      = 0;
+    s->frame_packet_size          = 0;
+    s->frame_packet_from_start    = 0;
+    s->stats                      = (DVPipelineStats){0};
+    s->coeff_blocks_are_spatial   = 0;
+    s->idct_upload_ready          = 0;
     s->dequant_output_in_idct_buf = 0;
+    s->active_frame_slot          = -1;
+}
+
+static int dv_vk_create_buffer(FFVulkanContext *vk, FFVkBuffer *buf, size_t size, VkBufferUsageFlags usage,
+                               VkMemoryPropertyFlagBits mem_props)
+{
+    return ff_vk_create_buf(vk, buf, size, NULL, NULL, usage, mem_props);
+}
+
+static int dv_vk_create_mapped_buffer(FFVulkanContext *vk, FFVkBuffer *buf, size_t size, VkBufferUsageFlags usage,
+                                      void **map)
+{
+    int ret;
+
+    ret = dv_vk_create_buffer(vk, buf, size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_vk_map_buffer(vk, buf, (uint8_t **)map, 0);
+    if (ret < 0) {
+        ff_vk_free_buf(vk, buf);
+        memset(buf, 0, sizeof(*buf));
+    }
+
+    return ret;
+}
+
+static void dv_vk_free_buffer(FFVulkanContext *vk, FFVkBuffer *buf, void **map)
+{
+    if (!buf->buf)
+        return;
+
+    if (map && *map) {
+        ff_vk_unmap_buffer(vk, buf, 0);
+        *map = NULL;
+    }
+
+    ff_vk_free_buf(vk, buf);
+    memset(buf, 0, sizeof(*buf));
+}
+
+static int dv_vk_init_frame_slot(DVSubContext *s, DVVkFrameSlot *slot)
+{
+    int ret;
+
+    ret = dv_vk_create_buffer(&s->vk, &slot->quant_dev, DV_VK_MAX_SPARSE_BYTES,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ret < 0)
+        return ret;
+
+    ret = dv_vk_create_buffer(&s->vk, &slot->dequant_meta_dev, DV_VK_MAX_META_BYTES,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ret < 0)
+        return ret;
+
+    ret = dv_vk_create_buffer(&s->vk, &slot->idct_dev, DV_VK_MAX_IDCT_BYTES,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ret < 0)
+        return ret;
+
+    ret = dv_vk_create_buffer(&s->vk, &slot->recon_jobs_dev, DV_VK_MAX_JOBS_BYTES,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ret < 0)
+        return ret;
+
+    ret = dv_vk_create_buffer(&s->vk, &slot->recon_plane_dev, DV_VK_SD_PLANE_BYTES,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ret < 0)
+        return ret;
+    slot->recon_plane_size = DV_VK_SD_PLANE_BYTES;
+
+    ret = dv_vk_create_mapped_buffer(&s->vk, &slot->quant_stage, DV_VK_MAX_SPARSE_BYTES,
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, (void **)&slot->quant_stage_map);
+    if (ret < 0)
+        return ret;
+
+    ret = dv_vk_create_mapped_buffer(&s->vk, &slot->dequant_meta_stage, DV_VK_MAX_META_BYTES,
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, (void **)&slot->dequant_meta_stage_map);
+    if (ret < 0)
+        return ret;
+
+    ret = dv_vk_create_mapped_buffer(&s->vk, &slot->recon_jobs_stage, DV_VK_MAX_JOBS_BYTES,
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, (void **)&slot->recon_jobs_stage_map);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static void dv_vk_uninit_frame_slot(DVSubContext *s, DVVkFrameSlot *slot)
+{
+    dv_vk_free_buffer(&s->vk, &slot->quant_stage, (void **)&slot->quant_stage_map);
+    dv_vk_free_buffer(&s->vk, &slot->dequant_meta_stage, (void **)&slot->dequant_meta_stage_map);
+    dv_vk_free_buffer(&s->vk, &slot->recon_jobs_stage, (void **)&slot->recon_jobs_stage_map);
+    dv_vk_free_buffer(&s->vk, &slot->quant_dev, NULL);
+    dv_vk_free_buffer(&s->vk, &slot->dequant_meta_dev, NULL);
+    dv_vk_free_buffer(&s->vk, &slot->idct_dev, NULL);
+    dv_vk_free_buffer(&s->vk, &slot->recon_jobs_dev, NULL);
+    dv_vk_free_buffer(&s->vk, &slot->recon_plane_dev, NULL);
+    slot->completed_value = 0;
+}
+
+static int dv_vk_acquire_frame_slot(DVSubContext *s)
+{
+    DVVkFrameSlot *slot;
+    int            slot_idx;
+
+    if (s->active_frame_slot >= 0)
+        return s->active_frame_slot;
+
+    slot_idx = s->next_frame_slot;
+    slot     = &s->frame_slots[slot_idx];
+
+    if (slot->completed_value) {
+        VkSemaphoreWaitInfo wait_info = {
+            .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores    = &s->frame_timeline_sem,
+            .pValues        = &slot->completed_value,
+        };
+
+        s->vk.vkfn.WaitSemaphores(s->vk.hwctx->act_dev, &wait_info, UINT64_MAX);
+    }
+
+    s->active_frame_slot = slot_idx;
+    s->next_frame_slot   = (slot_idx + 1) % DV_VK_MAX_INFLIGHT_FRAMES;
+
+    return slot_idx;
+}
+
+static void dv_vk_cmd_copy_buffer(FFVulkanContext *vk, FFVkExecContext *exec, const FFVkBuffer *src, const FFVkBuffer *dst, size_t size)
+{
+    VkBufferCopy copy = {
+        .srcOffset = 0,
+        .dstOffset = 0,
+        .size      = size,
+    };
+
+    vk->vkfn.CmdCopyBuffer(exec->buf, src->buf, dst->buf, 1, &copy);
+}
+
+static int dv_vk_exec_add_signal_sem(FFVulkanContext *vk, FFVkExecContext *exec, VkSemaphore sem, uint64_t value,
+                                     VkPipelineStageFlagBits2 stage)
+{
+    VkSemaphoreSubmitInfo *sem_sig = av_fast_realloc(exec->sem_sig, &exec->sem_sig_alloc, (exec->sem_sig_cnt + 1) * sizeof(*sem_sig));
+    if (!sem_sig) {
+        ff_vk_exec_discard_deps(vk, exec);
+        return AVERROR(ENOMEM);
+    }
+
+    exec->sem_sig = sem_sig;
+    exec->sem_sig[exec->sem_sig_cnt++] = (VkSemaphoreSubmitInfo){
+        .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = sem,
+        .value     = value,
+        .stageMask = stage,
+    };
+
+    return 0;
+}
+
+static int dv_vk_upload_static_table(FFVulkanContext *vk, FFVkExecPool *pool, FFVkBuffer *dst, const void *src, size_t size)
+{
+    FFVkBuffer       staging = {0};
+    FFVkExecContext *exec;
+    void            *map = NULL;
+    int              ret;
+
+    ret = dv_vk_create_mapped_buffer(vk, &staging, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &map);
+    if (ret < 0)
+        return ret;
+
+    memcpy(map, src, size);
+    ff_vk_unmap_buffer(vk, &staging, 0);
+
+    if (dst->buf)
+        dv_vk_free_buffer(vk, dst, NULL);
+
+    ret = dv_vk_create_buffer(vk, dst, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ret < 0) {
+        ff_vk_free_buf(vk, &staging);
+        return ret;
+    }
+
+    exec = ff_vk_exec_get(vk, pool);
+    if (!exec) {
+        ff_vk_free_buf(vk, &staging);
+        return AVERROR_EXTERNAL;
+    }
+
+    ret = ff_vk_exec_start(vk, exec);
+    if (ret < 0) {
+        ff_vk_free_buf(vk, &staging);
+        return ret;
+    }
+
+    dv_vk_cmd_copy_buffer(vk, exec, &staging, dst, size);
+
+    ret = ff_vk_exec_submit(vk, exec);
+    if (ret < 0) {
+        ff_vk_free_buf(vk, &staging);
+        return ret;
+    }
+
+    ff_vk_exec_wait(vk, exec);
+    ff_vk_free_buf(vk, &staging);
+    return 0;
 }
 
 static int dv_vk_cache_packet(DVSubContext *s, const uint8_t *data, uint32_t size)
@@ -890,9 +1273,41 @@ static int dv_vk_cache_packet(DVSubContext *s, const uint8_t *data, uint32_t siz
     return 0;
 }
 
+static int dv_vk_upload_profile_tables(AVCodecContext *avctx, DVSubContext *s)
+{
+    uint32_t inv_scan[2][64] = {{0}};
+    int      profile_key;
+    int      ret;
+
+    if (!s->sys)
+        return AVERROR(EINVAL);
+
+    profile_key = (s->sys->height << 16) | (s->sys->pix_fmt << 8) | s->sys->bpm;
+    if (s->gpu_table_profile_key == profile_key && s->factor_tables_dev.buf && s->inv_scan_dev.buf)
+        return 0;
+
+    for (int tbl = 0; tbl < 2; tbl++) {
+        for (int pos = 0; pos < 64; pos++)
+            inv_scan[tbl][s->dv_zigzag[tbl][pos]] = pos;
+    }
+
+    ret = dv_vk_upload_static_table(&s->vk, &s->idct_exec_pool, &s->factor_tables_dev, s->idct_factor, sizeof(s->idct_factor));
+    if (ret < 0)
+        return ret;
+
+    ret = dv_vk_upload_static_table(&s->vk, &s->idct_exec_pool, &s->inv_scan_dev, inv_scan, sizeof(inv_scan));
+    if (ret < 0)
+        return ret;
+
+    s->gpu_table_profile_key = profile_key;
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: uploaded profile-scoped dequant tables for key=%d\n", profile_key);
+    return 0;
+}
+
 static int dv_vk_prepare_profile_and_tables(AVCodecContext *avctx, DVSubContext *s)
 {
     const AVDVProfile *sys;
+    int                ret;
 
     sys = ff_dv_frame_profile(avctx, s->sys, s->frame_packet, s->frame_packet_size);
     if (!sys) {
@@ -909,6 +1324,10 @@ static int dv_vk_prepare_profile_and_tables(AVCodecContext *avctx, DVSubContext 
     }
 
     s->sys = sys;
+
+    ret = dv_vk_upload_profile_tables(avctx, s);
+    if (ret < 0)
+        return ret;
 
     s->stats.work_pool_size        = dv_work_pool_size(sys);
     s->stats.frame_width           = sys->width;
@@ -971,74 +1390,42 @@ static int dv_vk_build_mb_jobs(AVCodecContext *avctx, DVSubContext *s)
     return 0;
 }
 
-static int dv_vk_prepare_coeff_staging(DVSubContext *s)
+static int dv_vk_prepare_coeff_staging(AVCodecContext *avctx, DVSubContext *s)
 {
     int needed_blocks = s->stats.mb_jobs * s->sys->bpm;
     int needed_coeffs = needed_blocks * 64;
 
+    (void)avctx;
+
+    s->stats.block_jobs = needed_blocks;
+
     if (needed_coeffs > s->coeff_blocks_alloc) {
-        int16_t *tmp = av_realloc_array(s->coeff_blocks, needed_coeffs, sizeof(*tmp));
-        if (!tmp)
+        int16_t *coeff_tmp = av_realloc_array(s->coeff_blocks, needed_coeffs, sizeof(*s->coeff_blocks));
+        if (!coeff_tmp)
             return AVERROR(ENOMEM);
-        s->coeff_blocks       = tmp;
+        s->coeff_blocks       = coeff_tmp;
         s->coeff_blocks_alloc = needed_coeffs;
     }
 
-    memset(s->coeff_blocks, 0, needed_coeffs * sizeof(*s->coeff_blocks));
-    s->stats.block_jobs = needed_blocks;
-
-    if (dv_vk_use_gpu_dequant(s)) {
-        if (needed_coeffs > s->dequant_blocks_alloc) {
-            int16_t  *quant_tmp  = av_realloc_array(s->quant_blocks, needed_coeffs, sizeof(*s->quant_blocks));
-            uint32_t *factor_tmp = av_realloc_array(s->factor_blocks, needed_coeffs, sizeof(*s->factor_blocks));
-            if (!quant_tmp || !factor_tmp) {
-                av_freep(&quant_tmp);
-                av_freep(&factor_tmp);
-                return AVERROR(ENOMEM);
-            }
-            s->quant_blocks         = quant_tmp;
-            s->factor_blocks        = factor_tmp;
-            s->dequant_blocks_alloc = needed_coeffs;
-        }
-    }
-
-    return 0;
-}
-
-static int dv_vk_prepare_plane_staging(DVSubContext *s)
-{
-    int       linesizes[4]         = {0};
-    ptrdiff_t linesizes_ptrdiff[4] = {0};
-    ptrdiff_t plane_sizes[4]       = {0};
-    int       ret;
-    int       total = 0;
-
-    ret = av_image_fill_linesizes(linesizes, s->stats.sw_format, s->stats.frame_width);
-    if (ret < 0)
-        return ret;
-
-    for (int i = 0; i < 4; i++)
-        linesizes_ptrdiff[i] = linesizes[i];
-
-    ret = av_image_fill_plane_sizes(plane_sizes, s->stats.sw_format, s->stats.frame_height, linesizes_ptrdiff);
-    if (ret < 0)
-        return ret;
-
-    for (int i = 0; i < 4; i++) {
-        if (plane_sizes[i] <= 0)
-            continue;
-        if (plane_sizes[i] > INT_MAX - total)
-            return AVERROR(EINVAL);
-        total += (int)plane_sizes[i];
-    }
-
-    if (total > s->plane_staging_size) {
-        uint8_t *tmp = av_realloc(s->plane_staging, total);
-        if (!tmp)
+    if (needed_blocks > s->dequant_blocks_alloc) {
+        DVVkSparseBlock *quant_tmp  = av_realloc_array(s->quant_blocks, needed_blocks, sizeof(*s->quant_blocks));
+        uint32_t        *meta_tmp   = av_realloc_array(s->dequant_meta_blocks, (size_t)needed_blocks * 2, sizeof(*s->dequant_meta_blocks));
+        if (!quant_tmp || !meta_tmp) {
+            av_freep(&quant_tmp);
+            av_freep(&meta_tmp);
             return AVERROR(ENOMEM);
-        s->plane_staging      = tmp;
-        s->plane_staging_size = total;
+        }
+        s->quant_blocks         = quant_tmp;
+        s->dequant_meta_blocks  = meta_tmp;
+        s->dequant_blocks_alloc = needed_blocks;
     }
+
+    if (s->coeff_blocks)
+        memset(s->coeff_blocks, 0, (size_t)needed_coeffs * sizeof(*s->coeff_blocks));
+    if (s->quant_blocks)
+        memset(s->quant_blocks, 0, (size_t)needed_blocks * sizeof(*s->quant_blocks));
+    if (s->dequant_meta_blocks)
+        memset(s->dequant_meta_blocks, 0, (size_t)needed_blocks * 2 * sizeof(*s->dequant_meta_blocks));
 
     return 0;
 }
@@ -1135,13 +1522,13 @@ static int dv_vk_get_plane_layout(enum AVPixelFormat fmt, int width, int height,
 
 static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
 {
-    DVSubContext       *s             = avctx->internal->hwaccel_priv_data;
-    const DVwork_chunk *wc            = arg;
-    const int           chunk_index   = (int)(wc - s->work_chunks);
-    const int           log2_blocksize = 3;
-    const int           mb_base       = chunk_index * 5;
-    int                 coeff_base    = mb_base * s->sys->bpm;
-    const uint8_t      *buf_ptr       = &s->frame_packet[wc->buf_offset * 80];
+    DVSubContext       *s               = avctx->internal->hwaccel_priv_data;
+    const DVwork_chunk *wc              = arg;
+    const int           chunk_index     = (int)(wc - s->work_chunks);
+    const int           log2_blocksize  = 3;
+    const int           mb_base         = chunk_index * 5;
+    int                 coeff_base      = mb_base * s->sys->bpm;
+    const uint8_t      *buf_ptr         = &s->frame_packet[wc->buf_offset * 80];
     const int           use_gpu_dequant = dv_vk_use_gpu_dequant(s);
 
     for (int mb_index = 0; mb_index < 5; mb_index++) {
@@ -1158,10 +1545,9 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
         init_put_bits(&pb, mb_bit_buffer, 80);
 
         for (int j = 0; j < s->sys->bpm; j++) {
-            DVVkBlockInfo *mb           = &mb_data[j];
-            int16_t       *block        = use_gpu_dequant ? &s->quant_blocks[(coeff_base + j) * 64]
-                                                         : &s->coeff_blocks[(coeff_base + j) * 64];
-            uint32_t      *factor_block = use_gpu_dequant ? &s->factor_blocks[(coeff_base + j) * 64] : NULL;
+            DVVkBlockInfo *mb    = &mb_data[j];
+            int16_t       *block = &s->coeff_blocks[(coeff_base + j) * 64];
+            DVVkSparseBlock *sparse_block = use_gpu_dequant ? &s->quant_blocks[coeff_base + j] : NULL;
             int            last_index   = s->sys->block_sizes[j];
             int            dc, dct_mode, class1;
 
@@ -1177,9 +1563,8 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
                 is_field_mode |= (!j && dct_mode);
             } else {
                 mb->scan_table   = s->dv_zigzag[dct_mode && log2_blocksize == 3];
-                mb->factor_table =
-                    &s->idct_factor[(class1 == 3) * 2 * 22 * 64 + (dct_mode && log2_blocksize == 3) * 22 * 64 +
-                                    (quant + ff_dv_quant_offset[class1]) * 64];
+                mb->factor_table = &s->idct_factor[(class1 == 3) * 2 * 22 * 64 + (dct_mode && log2_blocksize == 3) * 22 * 64 +
+                                                   (quant + ff_dv_quant_offset[class1]) * 64];
             }
 
             dc                    = dc * 4 + 1024;
@@ -1187,10 +1572,19 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
             mb->pos               = 0;
             mb->partial_bit_count = 0;
 
-            if (factor_block)
-                factor_block[0] = 0;
+            if (use_gpu_dequant) {
+                uint32_t *meta = &s->dequant_meta_blocks[(coeff_base + j) * 2];
+                meta[0] = (uint32_t)(mb->factor_table - s->idct_factor);
+                meta[1] = (mb->scan_table == s->dv_zigzag[1]) ? 1u : 0u;
 
-            dv_vk_decode_ac(&gb, mb, block, use_gpu_dequant ? block : NULL, factor_block);
+                sparse_block->count = 0;
+                /* DC coefficient is always at index 0 */
+                sparse_block->coeffs[0].idx   = 0;
+                sparse_block->coeffs[0].value = (int16_t)dc;
+                sparse_block->count           = 1;
+            }
+
+            dv_vk_decode_ac(&gb, mb, block, sparse_block, NULL);
 
             if (mb->pos >= 64)
                 dv_vk_bit_copy(&pb, &gb);
@@ -1204,12 +1598,11 @@ static int dv_vk_decode_entropy_chunk(AVCodecContext *avctx, void *arg)
         init_get_bits(&gb, mb_bit_buffer, put_bits_count(&pb));
         for (int j = 0; j < s->sys->bpm; j++) {
             DVVkBlockInfo *mb    = &mb_data[j];
-            int16_t       *block = use_gpu_dequant ? &s->quant_blocks[(coeff_base + j) * 64]
-                                                   : &s->coeff_blocks[(coeff_base + j) * 64];
-            uint32_t      *factor_block = use_gpu_dequant ? &s->factor_blocks[(coeff_base + j) * 64] : NULL;
+            int16_t       *block = &s->coeff_blocks[(coeff_base + j) * 64];
+            DVVkSparseBlock *sparse_block = use_gpu_dequant ? &s->quant_blocks[coeff_base + j] : NULL;
 
             if (mb->pos < 64 && get_bits_left(&gb) > 0)
-                dv_vk_decode_ac(&gb, mb, block, use_gpu_dequant ? block : NULL, factor_block);
+                dv_vk_decode_ac(&gb, mb, block, sparse_block, NULL);
         }
 
         s->mb_field_modes[mb_base + mb_index] = !!is_field_mode;
@@ -1223,11 +1616,7 @@ static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
 {
     avctx->execute(avctx, dv_vk_decode_entropy_chunk, s->work_chunks, NULL, s->stats.work_pool_size, sizeof(DVwork_chunk));
 
-    if (dv_vk_use_gpu_dequant(s)) {
-        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (quantized coeffs)\n", s->stats.block_jobs);
-    } else {
-        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU entropy filled %d blocks (dequantized coeffs)\n", s->stats.block_jobs);
-    }
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: entropy stage filled %d blocks\n", s->stats.block_jobs);
     s->coeff_blocks_are_spatial = 0;
 
     return 0;
@@ -1235,962 +1624,80 @@ static int dv_vk_stage_cpu_entropy(AVCodecContext *avctx, DVSubContext *s)
 
 static int dv_vk_stage_gpu_dequant(AVCodecContext *avctx, DVSubContext *s)
 {
-    int             num_blocks = s->stats.block_jobs;
-    int             num_coeffs = num_blocks * 64;
-    size_t          quant_bytes;
-    size_t          factor_bytes;
-    size_t          idct_bytes;
-    FFVkExecContext *exec;
-    int             err;
+    int            num_blocks = s->stats.block_jobs;
+    size_t         meta_bytes;
+    int            slot_idx;
+    DVVkFrameSlot *slot;
 
     s->dequant_output_in_idct_buf = 0;
 
     if (!dv_vk_use_gpu_dequant(s)) {
-        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: dequant stage skipped (already done in entropy decode, %d blocks)\n", num_blocks);
+        return AVERROR(ENOSYS);
+    }
+
+    if (num_blocks <= 0)
         return 0;
-    }
 
-    if (num_blocks <= 0 || num_coeffs <= 0)
-        return 0;
+    meta_bytes = (size_t)num_blocks * 2 * sizeof(uint32_t);
+    slot_idx = dv_vk_acquire_frame_slot(s);
+    if (slot_idx < 0)
+        return slot_idx;
 
-    quant_bytes  = (size_t)num_coeffs * sizeof(int32_t);
-    factor_bytes = (size_t)num_coeffs * sizeof(uint32_t);
-    idct_bytes   = (size_t)num_blocks * 128 * sizeof(int32_t);
-
-    if (quant_bytes > s->dequant_quant_buf_size) {
-        if (s->dequant_quant_buf.buf) {
-            if (s->dequant_quant_buf_map) {
-                ff_vk_unmap_buffer(&s->vk, &s->dequant_quant_buf, 0);
-                s->dequant_quant_buf_map = NULL;
-            }
-            ff_vk_free_buf(&s->vk, &s->dequant_quant_buf);
-        }
-
-        err = ff_vk_create_buf(&s->vk, &s->dequant_quant_buf, quant_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (err < 0)
-            return err;
-
-        err = ff_vk_map_buffer(&s->vk, &s->dequant_quant_buf, (uint8_t **)&s->dequant_quant_buf_map, 0);
-        if (err < 0)
-            return err;
-
-        s->dequant_quant_buf_size = quant_bytes;
-    }
-
-    if (factor_bytes > s->dequant_factor_buf_size) {
-        if (s->dequant_factor_buf.buf) {
-            if (s->dequant_factor_buf_map) {
-                ff_vk_unmap_buffer(&s->vk, &s->dequant_factor_buf, 0);
-                s->dequant_factor_buf_map = NULL;
-            }
-            ff_vk_free_buf(&s->vk, &s->dequant_factor_buf);
-        }
-
-        err = ff_vk_create_buf(&s->vk, &s->dequant_factor_buf, factor_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (err < 0)
-            return err;
-
-        err = ff_vk_map_buffer(&s->vk, &s->dequant_factor_buf, (uint8_t **)&s->dequant_factor_buf_map, 0);
-        if (err < 0)
-            return err;
-
-        s->dequant_factor_buf_size = factor_bytes;
-    }
-
-    if (idct_bytes > s->idct_buf_size) {
-        if (s->idct_buf.buf) {
-            if (s->idct_buf_map) {
-                ff_vk_unmap_buffer(&s->vk, &s->idct_buf, 0);
-                s->idct_buf_map = NULL;
-            }
-            ff_vk_free_buf(&s->vk, &s->idct_buf);
-        }
-
-        err = ff_vk_create_buf(&s->vk, &s->idct_buf, idct_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (err < 0)
-            return err;
-
-        err = ff_vk_map_buffer(&s->vk, &s->idct_buf, (uint8_t **)&s->idct_buf_map, 0);
-        if (err < 0)
-            return err;
-
-        s->idct_buf_size = idct_bytes;
-    }
-
-    if (!s->dequant_quant_buf_map || !s->dequant_factor_buf_map)
+    slot = &s->frame_slots[slot_idx];
+    if (!slot->quant_stage_map || !slot->dequant_meta_stage_map)
         return AVERROR_EXTERNAL;
 
-    for (int i = 0; i < num_coeffs; i++)
-        s->dequant_quant_buf_map[i] = s->quant_blocks[i];
+    memcpy(slot->quant_stage_map, s->quant_blocks, (size_t)num_blocks * sizeof(DVVkSparseBlock));
+    memcpy(slot->dequant_meta_stage_map, s->dequant_meta_blocks, meta_bytes);
 
-    memcpy(s->dequant_factor_buf_map, s->factor_blocks, factor_bytes);
-
-    exec = ff_vk_exec_get(&s->vk, &s->idct_exec_pool);
-    if (!exec)
-        return AVERROR_EXTERNAL;
-
-    err = ff_vk_exec_start(&s->vk, exec);
-    if (err < 0)
-        return err;
-
-    err = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 0, 0, &s->dequant_quant_buf, 0, quant_bytes,
-                                          VK_FORMAT_UNDEFINED);
-    if (err < 0)
-        return err;
-
-    err = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 1, 0, &s->dequant_factor_buf, 0, factor_bytes,
-                                          VK_FORMAT_UNDEFINED);
-    if (err < 0)
-        return err;
-
-    err = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 2, 0, &s->idct_buf, 0, idct_bytes,
-                                          VK_FORMAT_UNDEFINED);
-    if (err < 0)
-        return err;
-
-    ff_vk_exec_bind_shader(&s->vk, exec, &s->dequant_shd);
-
-    {
-        DVVkDequantPush pd = {
-            .num_coeffs    = (uint32_t)num_coeffs,
-            .iweight_bits  = (uint32_t)dv_vk_iweight_bits,
-            .output_stride = 128,
-            .output_base   = 0,
-        };
-
-        ff_vk_shader_update_push_const(&s->vk, exec, &s->dequant_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
-    }
-
-    s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)((num_coeffs + 63) / 64), 1, 1);
-
-    err = ff_vk_exec_submit(&s->vk, exec);
-    if (err < 0)
-        return err;
-
-    ff_vk_exec_wait(&s->vk, exec);
-
-    s->dequant_output_in_idct_buf = 1;
-    return 0;
-}
-
-static av_always_inline void dv_vk_put_block_8x8(uint8_t *dst, ptrdiff_t linesize, const int16_t *block)
-{
-    for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < 8; x++)
-            dst[x] = av_clip_uint8(block[y * 8 + x]);
-        dst += linesize;
-    }
-}
-
-static av_always_inline void dv_vk_put_block_8x4(uint8_t *dst, ptrdiff_t linesize, const int16_t *block)
-{
-    for (int y = 0; y < 4; y++) {
-        for (int x = 0; x < 8; x++)
-            dst[x] = av_clip_uint8(block[y * 8 + x]);
-        dst += linesize;
-    }
-}
-
-static void dv_vk_put_last_row_field_chroma(uint8_t *dst, ptrdiff_t linesize, int16_t *blocks)
-{
-    ff_simple_idct_int16_8bit(blocks + 0 * 64);
-    ff_simple_idct_int16_8bit(blocks + 1 * 64);
-
-    dv_vk_put_block_8x4(dst, linesize << 1, blocks + 0 * 64);
-    dv_vk_put_block_8x4(dst + 8, linesize << 1, blocks + 0 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + linesize, linesize << 1, blocks + 1 * 64);
-    dv_vk_put_block_8x4(dst + 8 + linesize, linesize << 1, blocks + 1 * 64 + 4 * 8);
-}
-
-static void dv_vk_put_last_row_field_luma(uint8_t *dst, ptrdiff_t linesize, int16_t *blocks)
-{
-    ff_simple_idct_int16_8bit(blocks + 0 * 64);
-    ff_simple_idct_int16_8bit(blocks + 1 * 64);
-    ff_simple_idct_int16_8bit(blocks + 2 * 64);
-    ff_simple_idct_int16_8bit(blocks + 3 * 64);
-
-    dv_vk_put_block_8x4(dst, linesize << 1, blocks + 0 * 64);
-    dv_vk_put_block_8x4(dst + 16, linesize << 1, blocks + 0 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + 8, linesize << 1, blocks + 1 * 64);
-    dv_vk_put_block_8x4(dst + 24, linesize << 1, blocks + 1 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + linesize, linesize << 1, blocks + 2 * 64);
-    dv_vk_put_block_8x4(dst + 16 + linesize, linesize << 1, blocks + 2 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + 8 + linesize, linesize << 1, blocks + 3 * 64);
-    dv_vk_put_block_8x4(dst + 24 + linesize, linesize << 1, blocks + 3 * 64 + 4 * 8);
-}
-
-static void dv_vk_put_last_row_field_chroma_spatial(uint8_t *dst, ptrdiff_t linesize, const int16_t *blocks)
-{
-    dv_vk_put_block_8x4(dst, linesize << 1, blocks + 0 * 64);
-    dv_vk_put_block_8x4(dst + 8, linesize << 1, blocks + 0 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + linesize, linesize << 1, blocks + 1 * 64);
-    dv_vk_put_block_8x4(dst + 8 + linesize, linesize << 1, blocks + 1 * 64 + 4 * 8);
-}
-
-static void dv_vk_put_last_row_field_luma_spatial(uint8_t *dst, ptrdiff_t linesize, const int16_t *blocks)
-{
-    dv_vk_put_block_8x4(dst, linesize << 1, blocks + 0 * 64);
-    dv_vk_put_block_8x4(dst + 16, linesize << 1, blocks + 0 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + 8, linesize << 1, blocks + 1 * 64);
-    dv_vk_put_block_8x4(dst + 24, linesize << 1, blocks + 1 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + linesize, linesize << 1, blocks + 2 * 64);
-    dv_vk_put_block_8x4(dst + 16 + linesize, linesize << 1, blocks + 2 * 64 + 4 * 8);
-    dv_vk_put_block_8x4(dst + 8 + linesize, linesize << 1, blocks + 3 * 64);
-    dv_vk_put_block_8x4(dst + 24 + linesize, linesize << 1, blocks + 3 * 64 + 4 * 8);
-}
-
-static int dv_vk_convert_411_to_420(DVSubContext *s, uint8_t *const src_data[4], const int src_linesize[4], uint8_t *const dst_data[4],
-                                    const int dst_linesize[4])
-{
-    int width  = s->stats.frame_width;
-    int height = s->stats.frame_height;
-
-    if (width <= 0 || height <= 0)
-        return AVERROR(EINVAL);
-
-    for (int y = 0; y < height; y++)
-        memcpy(dst_data[0] + y * dst_linesize[0], src_data[0] + y * src_linesize[0], width);
-
-    for (int plane = 1; plane <= 2; plane++) {
-        int dst_chroma_w = width >> 1;
-        int dst_chroma_h = height >> 1;
-
-        for (int y = 0; y < dst_chroma_h; y++) {
-            const uint8_t *src0 = src_data[plane] + (2 * y) * src_linesize[plane];
-            const uint8_t *src1 = src_data[plane] + FFMIN(2 * y + 1, height - 1) * src_linesize[plane];
-            uint8_t       *dst  = dst_data[plane] + y * dst_linesize[plane];
-
-            for (int x = 0; x < dst_chroma_w; x++) {
-                int sx = x >> 1;
-                dst[x] = (uint8_t)((src0[sx] + src1[sx] + 1) >> 1);
-            }
-        }
-    }
-
-    return 0;
-}
-
-static int dv_vk_stage_cpu_reconstruct_yuv(AVCodecContext *avctx, DVSubContext *s)
-{
-    const int          log2_blocksize        = 3;
-    enum AVPixelFormat decode_fmt            = s->sys->pix_fmt;
-    enum AVPixelFormat output_fmt            = s->stats.sw_format;
-    int                dec_linesizes[4]      = {0};
-    ptrdiff_t          dec_plane_sizes[4]    = {0};
-    ptrdiff_t          dec_plane_offsets[4]  = {0};
-    uint8_t           *dec_plane_data[4]     = {0};
-    int                out_linesizes[4]      = {0};
-    ptrdiff_t          out_plane_sizes[4]    = {0};
-    ptrdiff_t          out_plane_offsets[4]  = {0};
-    uint8_t           *out_plane_data[4]     = {0};
-    int                block_cursor          = 0;
-    int                blocks_are_spatial    = !!s->coeff_blocks_are_spatial;
-    const int          chroma_411_split_mb_x = s->stats.chroma_411_split_mb_x;
-    const int          last_mb_y             = s->stats.last_mb_y;
-    int                ret;
-
-    ret =
-        dv_vk_get_plane_layout(output_fmt, s->stats.frame_width, s->stats.frame_height, out_linesizes, out_plane_sizes, out_plane_offsets);
-    if (ret < 0)
-        return ret;
-
-    for (int i = 0; i < 4; i++) {
-        if (out_plane_sizes[i] <= 0)
-            continue;
-        out_plane_data[i] = s->plane_staging + out_plane_offsets[i];
-    }
-
-    if (decode_fmt == output_fmt) {
-        memcpy(dec_linesizes, out_linesizes, sizeof(dec_linesizes));
-        memcpy(dec_plane_sizes, out_plane_sizes, sizeof(dec_plane_sizes));
-        memcpy(dec_plane_offsets, out_plane_offsets, sizeof(dec_plane_offsets));
-        for (int i = 0; i < 4; i++)
-            dec_plane_data[i] = out_plane_data[i];
-    } else {
-        int needed = 0;
-
-        ret = dv_vk_get_plane_layout(decode_fmt, s->stats.frame_width, s->stats.frame_height, dec_linesizes, dec_plane_sizes,
-                                     dec_plane_offsets);
-        if (ret < 0)
-            return ret;
-
-        for (int i = 0; i < 4; i++) {
-            if (dec_plane_sizes[i] <= 0)
-                continue;
-            if (dec_plane_sizes[i] > INT_MAX - needed)
-                return AVERROR(EINVAL);
-            needed += (int)dec_plane_sizes[i];
-        }
-
-        if (needed > s->decode_plane_staging_size) {
-            uint8_t *tmp = av_realloc(s->decode_plane_staging, needed);
-            if (!tmp)
-                return AVERROR(ENOMEM);
-            s->decode_plane_staging      = tmp;
-            s->decode_plane_staging_size = needed;
-        }
-
-        for (int i = 0; i < 4; i++) {
-            if (dec_plane_sizes[i] <= 0)
-                continue;
-            dec_plane_data[i] = s->decode_plane_staging + dec_plane_offsets[i];
-        }
-    }
-
-    for (int mb_job_idx = 0; mb_job_idx < s->stats.mb_jobs; mb_job_idx++) {
-        const DVMacroblockJob *job           = &s->mb_jobs[mb_job_idx];
-        int16_t               *block         = &s->coeff_blocks[block_cursor * 64];
-        int                    mb_x          = job->mb_x;
-        int                    mb_y          = job->mb_y;
-        int                    is_field_mode = (mb_job_idx < s->mb_field_modes_alloc) ? !!s->mb_field_modes[mb_job_idx] : 0;
-        int                    y_stride;
-        int                    linesize;
-        uint8_t               *y_ptr;
-        int                    c_offset;
-
-        if ((decode_fmt == AV_PIX_FMT_YUV420P) || (decode_fmt == AV_PIX_FMT_YUV411P && mb_x >= chroma_411_split_mb_x) ||
-            (s->stats.frame_height >= 720 && mb_y != last_mb_y)) {
-            y_stride = (dec_linesizes[0] << ((!is_field_mode) * log2_blocksize));
-        } else {
-            y_stride = (2 << log2_blocksize);
-        }
-
-        y_ptr = dec_plane_data[0] + ((mb_y * dec_linesizes[0] + mb_x) << log2_blocksize);
-
-        if (mb_y == last_mb_y && is_field_mode) {
-            if (blocks_are_spatial)
-                dv_vk_put_last_row_field_luma_spatial(y_ptr, dec_linesizes[0], block);
-            else
-                dv_vk_put_last_row_field_luma(y_ptr, dec_linesizes[0], block);
-        } else {
-            linesize = dec_linesizes[0] << is_field_mode;
-            if (blocks_are_spatial)
-                dv_vk_put_block_8x8(y_ptr, linesize, block + 0 * 64);
-            else
-                ff_simple_idct_put_int16_8bit(y_ptr, linesize, block + 0 * 64);
-            if (s->sys->video_stype == 4) {
-                if (blocks_are_spatial)
-                    dv_vk_put_block_8x8(y_ptr + (1 << log2_blocksize), linesize, block + 2 * 64);
-                else
-                    ff_simple_idct_put_int16_8bit(y_ptr + (1 << log2_blocksize), linesize, block + 2 * 64);
-            } else {
-                if (blocks_are_spatial)
-                    dv_vk_put_block_8x8(y_ptr + (1 << log2_blocksize), linesize, block + 1 * 64);
-                else
-                    ff_simple_idct_put_int16_8bit(y_ptr + (1 << log2_blocksize), linesize, block + 1 * 64);
-
-                if (blocks_are_spatial)
-                    dv_vk_put_block_8x8(y_ptr + y_stride, linesize, block + 2 * 64);
-                else
-                    ff_simple_idct_put_int16_8bit(y_ptr + y_stride, linesize, block + 2 * 64);
-
-                if (blocks_are_spatial)
-                    dv_vk_put_block_8x8(y_ptr + (1 << log2_blocksize) + y_stride, linesize, block + 3 * 64);
-                else
-                    ff_simple_idct_put_int16_8bit(y_ptr + (1 << log2_blocksize) + y_stride, linesize, block + 3 * 64);
-            }
-        }
-
-        block += 4 * 64;
-
-        c_offset =
-            (((mb_y >> (decode_fmt == AV_PIX_FMT_YUV420P)) * dec_linesizes[1] + (mb_x >> ((decode_fmt == AV_PIX_FMT_YUV411P) ? 2 : 1)))
-             << log2_blocksize);
-
-        for (int plane = 2; plane >= 1; plane--) {
-            uint8_t *c_ptr = dec_plane_data[plane] + c_offset;
-
-            if (decode_fmt == AV_PIX_FMT_YUV411P && mb_x >= chroma_411_split_mb_x) {
-                uint8_t aligned_pixels[64];
-                if (blocks_are_spatial) {
-                    for (int y = 0; y < 8; y++) {
-                        for (int x = 0; x < 8; x++)
-                            aligned_pixels[y * 8 + x] = av_clip_uint8(block[y * 8 + x]);
-                    }
-                } else {
-                    ff_simple_idct_put_int16_8bit(aligned_pixels, 8, block);
-                }
-                for (int y = 0; y < (1 << log2_blocksize); y++) {
-                    uint8_t       *dst0     = c_ptr + y * dec_linesizes[plane];
-                    uint8_t       *dst1     = dst0 + (dec_linesizes[plane] << log2_blocksize);
-                    const uint8_t *src_row  = aligned_pixels + y * 8;
-                    const uint8_t *src_row2 = src_row + ((1 << log2_blocksize) >> 1);
-
-                    for (int x = 0; x < (1 << FFMAX(log2_blocksize - 1, 0)); x++) {
-                        dst0[x] = src_row[x];
-                        dst1[x] = src_row2[x];
-                    }
-                }
-                block += 64;
-            } else {
-                y_stride = (mb_y == last_mb_y) ? (1 << log2_blocksize) : dec_linesizes[plane] << ((!is_field_mode) * log2_blocksize);
-                if (mb_y == last_mb_y && is_field_mode) {
-                    if (blocks_are_spatial)
-                        dv_vk_put_last_row_field_chroma_spatial(c_ptr, dec_linesizes[plane], block);
-                    else
-                        dv_vk_put_last_row_field_chroma(c_ptr, dec_linesizes[plane], block);
-                    block += 2 * 64;
-                } else {
-                    linesize = dec_linesizes[plane] << is_field_mode;
-                    if (blocks_are_spatial)
-                        dv_vk_put_block_8x8(c_ptr, linesize, block);
-                    else
-                        ff_simple_idct_put_int16_8bit(c_ptr, linesize, block);
-                    block += 64;
-                    if (s->sys->bpm == 8) {
-                        if (blocks_are_spatial)
-                            dv_vk_put_block_8x8(c_ptr + y_stride, linesize, block);
-                        else
-                            ff_simple_idct_put_int16_8bit(c_ptr + y_stride, linesize, block);
-                        block += 64;
-                    }
-                }
-            }
-        }
-
-        block_cursor += s->sys->bpm;
-    }
-
-    if (decode_fmt != output_fmt) {
-        if (decode_fmt == AV_PIX_FMT_YUV411P && output_fmt == AV_PIX_FMT_YUV420P) {
-            ret = dv_vk_convert_411_to_420(s, dec_plane_data, dec_linesizes, out_plane_data, out_linesizes);
-            if (ret < 0)
-                return ret;
-        } else {
-            av_log(avctx, AV_LOG_ERROR, "dv_vulkan: unsupported CPU format conversion %s -> %s\n", av_get_pix_fmt_name(decode_fmt),
-                   av_get_pix_fmt_name(output_fmt));
-            return AVERROR_PATCHWELCOME;
-        }
-    }
-
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: CPU plane reconstruction filled %d blocks\n", block_cursor);
-
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: staged %d sparse blocks into frame slot %d\n", num_blocks, slot_idx);
     return 0;
 }
 
 static int dv_vk_stage_idct(AVCodecContext *avctx, DVSubContext *s)
 {
-    int    num_blocks = s->stats.block_jobs;
-    int    err        = 0;
-    size_t bytes;
-
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: idct stage start (gpu=%d blocks=%d)\n", s->idct_gpu_ready, num_blocks);
-
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: fused IDCT path armed for %d blocks\n", s->stats.block_jobs);
     s->coeff_blocks_are_spatial = 0;
-    if (num_blocks <= 0)
-        return 0;
-
-    if (atomic_load(&dv_vk_global_disable_gpu_idct)) {
-        s->idct_gpu_ready = 0;
-    }
-
-    if (s->idct_gpu_ready) {
-        FFVkExecContext *exec;
-        int32_t         *gpu_storage;
-        int              blocks_per_row;
-        int              rows;
-
-        bytes = (size_t)num_blocks * 128 * sizeof(int32_t);
-
-        if (bytes > s->idct_buf_size) {
-            if (s->idct_buf.buf) {
-                if (s->idct_buf_map) {
-                    ff_vk_unmap_buffer(&s->vk, &s->idct_buf, 0);
-                    s->idct_buf_map = NULL;
-                }
-                ff_vk_free_buf(&s->vk, &s->idct_buf);
-            }
-
-            err = ff_vk_create_buf(&s->vk, &s->idct_buf, bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (err < 0)
-                goto gpu_fail;
-
-            err = ff_vk_map_buffer(&s->vk, &s->idct_buf, (uint8_t **)&s->idct_buf_map, 0);
-            if (err < 0)
-                goto gpu_fail;
-
-            s->idct_buf_size = bytes;
-        }
-
-        if (!s->dequant_output_in_idct_buf) {
-            gpu_storage = s->idct_buf_map;
-            if (!gpu_storage) {
-                err = AVERROR_EXTERNAL;
-                goto gpu_fail;
-            }
-            for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
-                int storage_base = block_idx * 128;
-                int coeff_base   = block_idx * 64;
-
-                for (int i = 0; i < 64; i++)
-                    gpu_storage[storage_base + i] = s->coeff_blocks[coeff_base + i];
-            }
-        }
-
-        if (s->recon_gpu_ready && dv_vk_recon_gpu_supported(s->sys)) {
-            s->idct_upload_ready        = 1;
-            s->coeff_blocks_are_spatial = 0;
-            s->dequant_output_in_idct_buf = 0;
-            if (!atomic_exchange(&dv_vk_global_logged_idct_gpu_active, 1))
-                av_log(avctx, AV_LOG_INFO, "dv_vulkan: IDCT stage wired (GPU coeff upload for batched reconstruction)\n");
-            av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: idct stage uploaded coeffs for GPU batched IDCT + reconstruction\n");
-            return 0;
-        }
-
-        exec = ff_vk_exec_get(&s->vk, &s->idct_exec_pool);
-        if (!exec) {
-            err = AVERROR_EXTERNAL;
-            goto gpu_fail;
-        }
-
-        err = ff_vk_exec_start(&s->vk, exec);
-        if (err < 0)
-            goto gpu_fail;
-
-        err = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->idct_shd, 0, 0, 0, &s->idct_buf, 0, bytes, VK_FORMAT_UNDEFINED);
-        if (err < 0)
-            goto gpu_fail;
-
-        ff_vk_exec_bind_shader(&s->vk, exec, &s->idct_shd);
-
-        blocks_per_row = FFMIN(num_blocks, 512);
-        rows           = (num_blocks + blocks_per_row - 1) / blocks_per_row;
-
-        {
-            DVVkIDCTPush pd = {
-                .num_blocks     = (uint32_t)num_blocks,
-                .blocks_per_row = (uint32_t)blocks_per_row,
-                .output_base    = 0,
-                .reserved       = 0,
-            };
-
-            ff_vk_shader_update_push_const(&s->vk, exec, &s->idct_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
-        }
-
-        s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)blocks_per_row, (uint32_t)rows, 1);
-
-        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: idct stage submitted gpu dispatch (%d blocks)\n", num_blocks);
-
-        err = ff_vk_exec_submit(&s->vk, exec);
-        if (err < 0)
-            goto gpu_fail;
-
-        ff_vk_exec_wait(&s->vk, exec);
-
-        {
-            gpu_storage = s->idct_buf_map;
-            if (!gpu_storage) {
-                err = AVERROR_EXTERNAL;
-                goto gpu_fail;
-            }
-            for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
-                int storage_base = block_idx * 128;
-                int coeff_base   = block_idx * 64;
-
-                for (int i = 0; i < 64; i++)
-                    s->coeff_blocks[coeff_base + i] = av_clip_int16(gpu_storage[storage_base + 64 + i]);
-            }
-
-            av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: idct stage readback for CPU fallback\n");
-        }
-
-    } else {
-        if (!atomic_exchange(&dv_vk_global_logged_idct_fallback, 1))
-            av_log(avctx, AV_LOG_ERROR, "dv_vulkan: GPU IDCT unavailable\n");
-        return AVERROR(ENOSYS);
-    }
-
-    if (!atomic_exchange(&dv_vk_global_logged_idct_gpu_active, 1)) {
-        av_log(avctx, AV_LOG_INFO, "dv_vulkan: IDCT stage wired (GPU dispatch active)\n");
-    }
-    s->logged_idct_fallback = 1;
-
-    s->coeff_blocks_are_spatial = 1;
-    return 0;
-
-gpu_fail:
-    if (!s->logged_idct_gpu_fail) {
-        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: GPU IDCT dispatch failed (%d)\n", err);
-        s->logged_idct_gpu_fail = 1;
-    }
-
-    atomic_store(&dv_vk_global_disable_gpu_idct, 1);
-    s->idct_gpu_ready = 0;
-    return err < 0 ? err : AVERROR_EXTERNAL;
+    s->idct_upload_ready        = 1;
+    return (s->idct_gpu_ready && s->recon_gpu_ready && dv_vk_recon_gpu_supported(s->sys)) ? 0 : AVERROR(ENOSYS);
 }
 
 static int dv_vk_stage_color_convert(AVCodecContext *avctx, DVSubContext *s)
 {
-    int      ret = 0;
-    uint32_t chroma_w_shift;
-    uint32_t chroma_h_shift;
-    uint32_t is_yuv411;
-    int      use_cpu_plane_upload = 0;
+    int                    ret;
+    uint32_t               chroma_w_shift;
+    uint32_t               chroma_h_shift;
+    uint32_t               is_yuv411;
+    AVFrame               *dst = NULL;
+    FFVkExecContext       *exec;
+    DVVkFrameSlot         *slot;
+    VkBufferMemoryBarrier2 buf_bar[3];
+    VkImageView            out_views[AV_NUM_DATA_POINTERS] = {0};
+    VkImageMemoryBarrier2  img_bar[8];
+    int                    nb_img_bar       = 0;
+    int                    groups_x         = FFALIGN(s->stats.frame_width, 8) / 8;
+    int                    groups_y         = FFALIGN(s->stats.frame_height, 8) / 8;
+    int                    src_linesizes[4] = {0};
+    ptrdiff_t              src_sizes[4]     = {0};
+    ptrdiff_t              src_offsets[4]   = {0};
+    uint32_t               src_widths[4]    = {0};
+    uint32_t               src_heights[4]   = {0};
+    size_t                 quant_bytes;
+    size_t                 meta_bytes;
+    size_t                 job_bytes;
+    size_t                 plane_bytes      = 0;
+    int                    num_blocks       = s->stats.mb_jobs * s->sys->bpm;
+    size_t                 idct_bytes       = (size_t)num_blocks * 128 * sizeof(int32_t);
+    uint64_t               signal_value;
 
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: color stage start (gpu=%d fmt=%s bpm=%d)\n", s->recon_gpu_ready,
-           av_get_pix_fmt_name(s->sys ? s->sys->pix_fmt : AV_PIX_FMT_NONE), s->sys ? s->sys->bpm : 0);
+    if (!(s->recon_gpu_ready && s->idct_gpu_ready && s->dequant_gpu_ready && dv_vk_recon_gpu_supported(s->sys)))
+        return AVERROR(ENOSYS);
+    if (s->active_frame_slot < 0 || !s->idct_upload_ready)
+        return AVERROR(EINVAL);
 
-    if (s->recon_gpu_ready && dv_vk_recon_gpu_supported(s->sys)) {
-        AVFrame               *dst = NULL;
-        FFVkExecContext       *exec;
-        VkBufferMemoryBarrier2 buf_bar[2];
-        VkImageView            out_views[AV_NUM_DATA_POINTERS] = {0};
-        VkImageMemoryBarrier2  img_bar[8];
-        int                    nb_img_bar       = 0;
-        int                    groups_x         = FFALIGN(s->stats.frame_width, 8) / 8;
-        int                    groups_y         = FFALIGN(s->stats.frame_height, 8) / 8;
-        int                    src_linesizes[4] = {0};
-        ptrdiff_t              src_sizes[4]     = {0};
-        ptrdiff_t              src_offsets[4]   = {0};
-        uint32_t               src_widths[4]    = {0};
-        uint32_t               src_heights[4]   = {0};
-        DVVkReconJob          *jobs             = NULL;
-        size_t                 job_bytes        = (size_t)s->stats.mb_jobs * sizeof(*jobs);
-        size_t                 plane_bytes      = 0;
-        int                    num_blocks       = s->stats.mb_jobs * s->sys->bpm;
-        size_t                 idct_bytes       = (size_t)num_blocks * 128 * sizeof(int32_t);
-
-        ret = dv_vk_get_chroma_shifts(use_cpu_plane_upload ? s->stats.sw_format : s->sys->pix_fmt, &chroma_w_shift, &chroma_h_shift,
-                                      &is_yuv411);
-        if (ret < 0)
-            goto gpu_recon_fail;
-
-        if (avctx->priv_data) {
-            DVVkDecoderBridge *bridge = avctx->priv_data;
-            if (bridge->frame)
-                dst = (AVFrame *)bridge->frame;
-        }
-        if (!dst && avctx->internal)
-            dst = avctx->internal->buffer_frame;
-
-        if (!dst || !dst->data[0] || dst->format != AV_PIX_FMT_VULKAN) {
-            ret = AVERROR(EINVAL);
-            goto gpu_recon_fail;
-        }
-
-        ret = dv_vk_get_plane_layout(use_cpu_plane_upload ? s->stats.sw_format : s->sys->pix_fmt, s->stats.frame_width,
-                                     s->stats.frame_height, src_linesizes, src_sizes, src_offsets);
-        if (ret < 0)
-            goto gpu_recon_fail;
-
-        src_widths[0]  = (uint32_t)s->stats.frame_width;
-        src_heights[0] = (uint32_t)s->stats.frame_height;
-        src_widths[1]  = (uint32_t)FFMAX(s->stats.frame_width >> chroma_w_shift, 1);
-        src_heights[1] = (uint32_t)FFMAX(s->stats.frame_height >> chroma_h_shift, 1);
-        src_widths[2]  = (uint32_t)FFMAX(s->stats.frame_width >> chroma_w_shift, 1);
-        src_heights[2] = (uint32_t)FFMAX(s->stats.frame_height >> chroma_h_shift, 1);
-
-        if (use_cpu_plane_upload) {
-            ret = dv_vk_stage_cpu_reconstruct_yuv(avctx, s);
-            if (ret < 0)
-                goto gpu_recon_fail;
-        }
-
-        for (int i = 0; i < 4; i++) {
-            if (src_sizes[i] > 0)
-                plane_bytes += (size_t)src_sizes[i];
-        }
-
-        plane_bytes = FFALIGN(plane_bytes, 4) * sizeof(uint32_t);
-
-        if (job_bytes > s->recon_jobs_buf_size) {
-            if (s->recon_jobs_buf.buf) {
-                if (s->recon_jobs_buf_map) {
-                    ff_vk_unmap_buffer(&s->vk, &s->recon_jobs_buf, 0);
-                    s->recon_jobs_buf_map = NULL;
-                }
-                ff_vk_free_buf(&s->vk, &s->recon_jobs_buf);
-            }
-
-            ret = ff_vk_create_buf(&s->vk, &s->recon_jobs_buf, job_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (ret < 0)
-                goto gpu_recon_fail;
-
-            ret = ff_vk_map_buffer(&s->vk, &s->recon_jobs_buf, (uint8_t **)&s->recon_jobs_buf_map, 0);
-            if (ret < 0)
-                goto gpu_recon_fail;
-            s->recon_jobs_buf_size = job_bytes;
-        }
-
-        if (plane_bytes > s->recon_plane_buf_size) {
-            if (s->recon_plane_buf.buf)
-                if (s->recon_plane_buf_map) {
-                    ff_vk_unmap_buffer(&s->vk, &s->recon_plane_buf, 0);
-                    s->recon_plane_buf_map = NULL;
-                }
-            if (s->recon_plane_buf.buf)
-                ff_vk_free_buf(&s->vk, &s->recon_plane_buf);
-
-            ret = ff_vk_create_buf(&s->vk, &s->recon_plane_buf, plane_bytes, NULL, NULL, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (ret < 0)
-                goto gpu_recon_fail;
-
-            ret = ff_vk_map_buffer(&s->vk, &s->recon_plane_buf, (uint8_t **)&s->recon_plane_buf_map, 0);
-            if (ret < 0)
-                goto gpu_recon_fail;
-            s->recon_plane_buf_size = plane_bytes;
-        }
-
-        if (use_cpu_plane_upload) {
-            if (!s->recon_plane_buf_map) {
-                ret = AVERROR(EINVAL);
-                goto gpu_recon_fail;
-            }
-
-            for (int plane = 0; plane < 4; plane++) {
-                if (src_sizes[plane] <= 0 || src_linesizes[plane] <= 0)
-                    continue;
-
-                for (uint32_t y = 0; y < (uint32_t)(src_sizes[plane] / src_linesizes[plane]); y++) {
-                    const uint8_t *src_row = s->plane_staging + src_offsets[plane] + (ptrdiff_t)y * src_linesizes[plane];
-                    uint32_t      *dst_row = s->recon_plane_buf_map + src_offsets[plane] + y * (uint32_t)src_linesizes[plane];
-
-                    memcpy(dst_row, src_row, (size_t)src_linesizes[plane]);
-                }
-            }
-        }
-
-        jobs = (DVVkReconJob *)s->recon_jobs_buf_map;
-        if (!jobs) {
-            ret = AVERROR_EXTERNAL;
-            goto gpu_recon_fail;
-        }
-
-        for (int i = 0; i < s->stats.mb_jobs; i++) {
-            jobs[i].mb_x       = (uint32_t)s->mb_jobs[i].mb_x;
-            jobs[i].mb_y       = (uint32_t)s->mb_jobs[i].mb_y;
-            jobs[i].field_mode = (uint32_t)((i < s->mb_field_modes_alloc) ? !!s->mb_field_modes[i] : 0);
-            jobs[i].reserved   = 0;
-        }
-
-        exec = ff_vk_exec_get(&s->vk, &s->idct_exec_pool);
-        if (!exec) {
-            ret = AVERROR_EXTERNAL;
-            goto gpu_recon_fail;
-        }
-
-        ret = ff_vk_exec_start(&s->vk, exec);
-        if (ret < 0)
-            goto gpu_recon_fail;
-
-        if (!s->idct_upload_ready) {
-            ret = AVERROR(EINVAL);
-            goto gpu_recon_fail;
-        }
-
-        if (!use_cpu_plane_upload && !s->coeff_blocks_are_spatial) {
-            ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->idct_shd, 0, 0, 0, &s->idct_buf, 0, idct_bytes, VK_FORMAT_UNDEFINED);
-            if (ret < 0)
-                goto gpu_recon_fail;
-
-            ff_vk_exec_bind_shader(&s->vk, exec, &s->idct_shd);
-
-            {
-                int          blocks_per_row = FFMIN(num_blocks, 512);
-                int          rows           = (num_blocks + blocks_per_row - 1) / blocks_per_row;
-                DVVkIDCTPush pd             = {
-                                .num_blocks     = (uint32_t)num_blocks,
-                                .blocks_per_row = (uint32_t)blocks_per_row,
-                                .output_base    = 0,
-                                .reserved       = 0,
-                };
-
-                ff_vk_shader_update_push_const(&s->vk, exec, &s->idct_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
-                s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)blocks_per_row, (uint32_t)rows, 1);
-            }
-
-            buf_bar[0] = (VkBufferMemoryBarrier2){
-                .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-                .srcStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .srcAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT,
-                .dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .buffer              = s->idct_buf.buf,
-                .offset              = 0,
-                .size                = idct_bytes,
-            };
-        } else if (!use_cpu_plane_upload) {
-            buf_bar[0] = (VkBufferMemoryBarrier2){
-                .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-                .srcStageMask        = VK_PIPELINE_STAGE_2_HOST_BIT,
-                .srcAccessMask       = VK_ACCESS_2_HOST_WRITE_BIT,
-                .dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .buffer              = s->idct_buf.buf,
-                .offset              = 0,
-                .size                = idct_bytes,
-            };
-        } else {
-            memset(&buf_bar[0], 0, sizeof(buf_bar[0]));
-        }
-        if (!use_cpu_plane_upload) {
-            s->vk.vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo){
-                                                          .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                                                          .bufferMemoryBarrierCount = 1,
-                                                          .pBufferMemoryBarriers    = buf_bar,
-                                                      });
-
-            ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_calc_shd, 0, 0, 0, &s->idct_buf, 0, s->idct_buf_size,
-                                                  VK_FORMAT_UNDEFINED);
-            if (ret < 0)
-                goto gpu_recon_fail;
-
-            ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_calc_shd, 0, 1, 0, &s->recon_jobs_buf, 0, s->recon_jobs_buf_size,
-                                                  VK_FORMAT_UNDEFINED);
-            if (ret < 0)
-                goto gpu_recon_fail;
-
-            ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_calc_shd, 0, 2, 0, &s->recon_plane_buf, 0,
-                                                  s->recon_plane_buf_size, VK_FORMAT_UNDEFINED);
-            if (ret < 0)
-                goto gpu_recon_fail;
-
-            ff_vk_exec_bind_shader(&s->vk, exec, &s->recon_calc_shd);
-
-            {
-                DVVkReconCalcPush pd = {0};
-
-                for (int i = 0; i < 4; i++) {
-                    pd.width[i]        = (src_sizes[i] > 0 && src_linesizes[i] > 0) ? (uint32_t)src_linesizes[i] : 0;
-                    pd.height[i]       = (src_sizes[i] > 0 && src_linesizes[i] > 0) ? (uint32_t)(src_sizes[i] / src_linesizes[i]) : 0;
-                    pd.plane_offset[i] = (uint32_t)src_offsets[i];
-                    pd.plane_stride[i] = (uint32_t)src_linesizes[i];
-                }
-                pd.num_blocks            = (uint32_t)num_blocks;
-                pd.blocks_per_mb         = (uint32_t)s->sys->bpm;
-                pd.chroma_w_shift        = chroma_w_shift;
-                pd.chroma_h_shift        = chroma_h_shift;
-                pd.is_yuv411             = is_yuv411;
-                pd.last_mb_y             = (uint32_t)s->stats.last_mb_y;
-                pd.chroma_411_split_mb_x = (uint32_t)s->stats.chroma_411_split_mb_x;
-
-                ff_vk_shader_update_push_const(&s->vk, exec, &s->recon_calc_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
-            }
-
-            s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)FFMIN(num_blocks, 512),
-                                   (uint32_t)((num_blocks + FFMIN(num_blocks, 512) - 1) / FFMIN(num_blocks, 512)), 1);
-        }
-
-        buf_bar[1] = (VkBufferMemoryBarrier2){
-            .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-            .srcStageMask        = use_cpu_plane_upload ? VK_PIPELINE_STAGE_2_HOST_BIT : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .srcAccessMask       = use_cpu_plane_upload ? VK_ACCESS_2_HOST_WRITE_BIT : VK_ACCESS_2_SHADER_WRITE_BIT,
-            .dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer              = s->recon_plane_buf.buf,
-            .offset              = 0,
-            .size                = s->recon_plane_buf_size,
-        };
-        s->vk.vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo){
-                                                      .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                                                      .bufferMemoryBarrierCount = 1,
-                                                      .pBufferMemoryBarriers    = &buf_bar[1],
-                                                  });
-
-        if (!use_cpu_plane_upload)
-            av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: color stage submitted batched IDCT + recon calc (%d blocks)\n", num_blocks);
-        else
-            av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: color stage submitted CPU YUV upload + GPU YUV->RGB path\n");
-
-        ret = ff_vk_exec_add_dep_frame(&s->vk, exec, dst, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        if (ret < 0)
-            goto gpu_recon_fail;
-
-        ret = ff_vk_create_imageviews(&s->vk, exec, out_views, dst, FF_VK_REP_FLOAT);
-        if (ret < 0)
-            goto gpu_recon_fail;
-
-        ff_vk_frame_barrier(&s->vk, exec, dst, img_bar, &nb_img_bar, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                            VK_QUEUE_FAMILY_IGNORED);
-        s->vk.vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo){
-                                                      .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                                                      .pImageMemoryBarriers    = img_bar,
-                                                      .imageMemoryBarrierCount = nb_img_bar,
-                                                  });
-
-        ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_shd, 0, 0, 0, &s->recon_plane_buf, 0, s->recon_plane_buf_size,
-                                              VK_FORMAT_UNDEFINED);
-        if (ret < 0)
-            goto gpu_recon_fail;
-
-        ff_vk_shader_update_img_array(&s->vk, exec, &s->recon_shd, dst, out_views, 0, 1, VK_IMAGE_LAYOUT_GENERAL, VK_NULL_HANDLE);
-
-        ff_vk_exec_bind_shader(&s->vk, exec, &s->recon_shd);
-
-        {
-            DVVkReconPush pd = {0};
-
-            for (int i = 0; i < 4; i++) {
-                pd.width[i]        = src_widths[i];
-                pd.height[i]       = src_heights[i];
-                pd.plane_offset[i] = (uint32_t)src_offsets[i];
-                pd.plane_stride[i] = (uint32_t)src_linesizes[i];
-            }
-            pd.chroma_w_shift = chroma_w_shift;
-            pd.chroma_h_shift = chroma_h_shift;
-
-            ff_vk_shader_update_push_const(&s->vk, exec, &s->recon_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
-        }
-
-        s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)groups_x, (uint32_t)groups_y, 1);
-
-        av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: color stage submitted recon calc + YUV->RGB pass (%dx%d) in single batch\n", groups_x,
-               groups_y);
-
-        ret = ff_vk_exec_submit(&s->vk, exec);
-        if (ret < 0)
-            goto gpu_recon_fail;
-        s->idct_upload_ready = 0;
-
-        s->cpu_output_required = 0;
-        return 0;
-
-    gpu_recon_fail:
-        ret = (ret < 0) ? ret : AVERROR_EXTERNAL;
-        if (!s->logged_recon_gpu_fail) {
-            av_log(avctx, AV_LOG_ERROR, "dv_vulkan: GPU reconstruction failed (%d)\n", ret);
-            s->logged_recon_gpu_fail = 1;
-        }
-        s->idct_upload_ready   = 0;
-        s->idct_gpu_ready      = 0;
-        s->recon_gpu_ready     = 0;
-        s->cpu_output_required = 0;
+    ret = dv_vk_get_chroma_shifts(s->sys->pix_fmt, &chroma_w_shift, &chroma_h_shift, &is_yuv411);
+    if (ret < 0)
         return ret;
-    }
-
-    av_log(avctx, AV_LOG_ERROR, "dv_vulkan: GPU reconstruction unavailable for this profile\n");
-    return AVERROR(ENOSYS);
-}
-
-static int dv_vk_stage_write_output(AVCodecContext *avctx, DVSubContext *s)
-{
-    AVFrame            src              = {0};
-    AVFrame           *dst              = NULL;
-    int                linesizes[4]     = {0};
-    ptrdiff_t          plane_sizes[4]   = {0};
-    ptrdiff_t          plane_offsets[4] = {0};
-    int                ret;
-    enum AVPixelFormat src_fmt;
-    const uint8_t     *src_base;
-
-    if (s->recon_gpu_ready && dv_vk_recon_gpu_supported(s->sys) && !s->cpu_output_required)
-        return 0;
-
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: output stage CPU upload path (format=%s, %dx%d)\n", av_get_pix_fmt_name(s->stats.sw_format),
-           s->stats.frame_width, s->stats.frame_height);
 
     if (avctx->priv_data) {
         DVVkDecoderBridge *bridge = avctx->priv_data;
@@ -2199,90 +1706,297 @@ static int dv_vk_stage_write_output(AVCodecContext *avctx, DVSubContext *s)
     }
     if (!dst && avctx->internal)
         dst = avctx->internal->buffer_frame;
-
     if (!dst || !dst->data[0] || dst->format != AV_PIX_FMT_VULKAN)
         return AVERROR(EINVAL);
 
-    src_fmt  = s->stats.sw_format;
-    src_base = s->plane_staging;
-
-    if (!src_base)
-        return AVERROR(EINVAL);
-
-    ret = dv_vk_get_plane_layout(src_fmt, s->stats.frame_width, s->stats.frame_height, linesizes, plane_sizes, plane_offsets);
+    ret = dv_vk_get_plane_layout(s->sys->pix_fmt, s->stats.frame_width, s->stats.frame_height, src_linesizes, src_sizes, src_offsets);
     if (ret < 0)
         return ret;
 
-    if (avctx->hw_frames_ctx) {
-        AVHWFramesContext *frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
+    for (int i = 0; i < 4; i++) {
+        if (src_sizes[i] > 0)
+            plane_bytes += (size_t)src_sizes[i];
+    }
+    plane_bytes = FFALIGN(plane_bytes, 4);
 
-        if (frames_ctx && frames_ctx->sw_format == AV_PIX_FMT_RGBA) {
-            struct SwsContext *sws              = NULL;
-            uint8_t           *rgba_data[4]     = {0};
-            int                rgba_linesize[4] = {0};
-            const uint8_t     *src_data[4]      = {0};
-            int                src_linesize[4]  = {0};
-            const int         *coeffs           = sws_getCoefficients(SWS_CS_ITU601);
-            for (int i = 0; i < 4; i++) {
-                if (plane_sizes[i] <= 0)
-                    continue;
-                src_data[i]     = src_base + plane_offsets[i];
-                src_linesize[i] = linesizes[i];
-            }
+    slot = &s->frame_slots[s->active_frame_slot];
 
-            sws = sws_getContext(s->stats.frame_width, s->stats.frame_height, src_fmt, s->stats.frame_width, s->stats.frame_height,
-                                 AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
-            if (!sws)
-                return AVERROR(ENOMEM);
+    if (plane_bytes > slot->recon_plane_size) {
+        dv_vk_free_buffer(&s->vk, &slot->recon_plane_dev, NULL);
+        ret = dv_vk_create_buffer(&s->vk, &slot->recon_plane_dev, plane_bytes,
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (ret < 0)
+            return ret;
+        slot->recon_plane_size = plane_bytes;
+    }
 
-            sws_setColorspaceDetails(sws, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
+    quant_bytes  = (size_t)num_blocks * sizeof(DVVkSparseBlock);
+    meta_bytes   = (size_t)num_blocks * 2 * sizeof(uint32_t);
+    job_bytes    = (size_t)s->stats.mb_jobs * sizeof(DVVkReconJob);
 
-            ret = av_image_alloc(rgba_data, rgba_linesize, s->stats.frame_width, s->stats.frame_height, AV_PIX_FMT_RGBA, 1);
-            if (ret < 0) {
-                sws_freeContext(sws);
+    src_widths[0]  = (uint32_t)s->stats.frame_width;
+    src_heights[0] = (uint32_t)s->stats.frame_height;
+    src_widths[1]  = (uint32_t)FFMAX(s->stats.frame_width >> chroma_w_shift, 1);
+    src_heights[1] = (uint32_t)FFMAX(s->stats.frame_height >> chroma_h_shift, 1);
+    src_widths[2]  = src_widths[1];
+    src_heights[2] = src_heights[1];
+
+    for (int i = 0; i < s->stats.mb_jobs; i++) {
+        slot->recon_jobs_stage_map[i].mb_x       = (uint32_t)s->mb_jobs[i].mb_x;
+        slot->recon_jobs_stage_map[i].mb_y       = (uint32_t)s->mb_jobs[i].mb_y;
+        slot->recon_jobs_stage_map[i].field_mode = (uint32_t)((i < s->mb_field_modes_alloc) ? !!s->mb_field_modes[i] : 0);
+        slot->recon_jobs_stage_map[i].reserved   = 0;
+    }
+
+    exec = &s->idct_exec_pool.contexts[s->active_frame_slot];
+    ret  = ff_vk_exec_start(&s->vk, exec);
+    if (ret < 0)
+        return ret;
+
+    FFVkExecContext *transfer_exec = exec;
+    if (s->transfer_qf) {
+        transfer_exec = ff_vk_exec_get(&s->vk, &s->transfer_pool);
+        if (transfer_exec) {
+            ret = ff_vk_exec_start(&s->vk, transfer_exec);
+            if (ret < 0)
                 return ret;
-            }
-
-            sws_scale(sws, src_data, src_linesize, 0, s->stats.frame_height, rgba_data, rgba_linesize);
-            sws_freeContext(sws);
-
-            src.format      = AV_PIX_FMT_RGBA;
-            src.width       = s->stats.frame_width;
-            src.height      = s->stats.frame_height;
-            src.data[0]     = rgba_data[0];
-            src.linesize[0] = rgba_linesize[0];
-
-            ret = av_hwframe_transfer_data(dst, &src, 0);
-            av_freep(&rgba_data[0]);
-            if (ret < 0) {
-                av_log(avctx, AV_LOG_ERROR, "dv_vulkan: failed to upload CPU reconstructed RGBA frame (%d)\n", ret);
-                return ret;
-            }
-
-            av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: uploaded CPU reconstructed RGBA frame to Vulkan output\n");
-            return 0;
+        } else {
+            transfer_exec = exec;
         }
     }
 
-    src.format = src_fmt;
-    src.width  = s->stats.frame_width;
-    src.height = s->stats.frame_height;
+    dv_vk_cmd_copy_buffer(&s->vk, transfer_exec, &slot->quant_stage, &slot->quant_dev, quant_bytes);
+    dv_vk_cmd_copy_buffer(&s->vk, transfer_exec, &slot->dequant_meta_stage, &slot->dequant_meta_dev, meta_bytes);
+    dv_vk_cmd_copy_buffer(&s->vk, transfer_exec, &slot->recon_jobs_stage, &slot->recon_jobs_dev, job_bytes);
 
-    for (int i = 0; i < 4; i++) {
-        if (plane_sizes[i] <= 0)
-            continue;
-        src.data[i]     = (uint8_t *)src_base + plane_offsets[i];
-        src.linesize[i] = linesizes[i];
+    if (transfer_exec != exec) {
+        uint64_t transfer_val = ++s->next_timeline_value;
+        dv_vk_exec_add_signal_sem(&s->vk, transfer_exec, s->frame_timeline_sem, transfer_val, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+        
+        VkSemaphoreSubmitInfo *wait_sem = av_fast_realloc(exec->sem_wait, &exec->sem_wait_alloc, (exec->sem_wait_cnt + 1) * sizeof(*wait_sem));
+        if (wait_sem) {
+            exec->sem_wait = wait_sem;
+            exec->sem_wait[exec->sem_wait_cnt++] = (VkSemaphoreSubmitInfo){
+                .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .semaphore = s->frame_timeline_sem,
+                .value     = transfer_val,
+                .stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            };
+        }
+        ff_vk_exec_submit(&s->vk, transfer_exec);
     }
 
-    ret = av_hwframe_transfer_data(dst, &src, 0);
-    if (ret < 0) {
-        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: failed to upload reconstructed frame (%d)\n", ret);
+    buf_bar[0] = (VkBufferMemoryBarrier2){
+        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask        = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer              = slot->quant_dev.buf,
+        .offset              = 0,
+        .size                = quant_bytes,
+    };
+    buf_bar[1] = buf_bar[0];
+    buf_bar[1].buffer = slot->dequant_meta_dev.buf;
+    buf_bar[1].size   = meta_bytes;
+    buf_bar[2] = buf_bar[0];
+    buf_bar[2].buffer = slot->recon_jobs_dev.buf;
+    buf_bar[2].size   = job_bytes;
+
+    s->vk.vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo){
+                                                  .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                                  .bufferMemoryBarrierCount = 3,
+                                                  .pBufferMemoryBarriers    = buf_bar,
+                                              });
+
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 0, 0, &slot->quant_dev, 0, quant_bytes, VK_FORMAT_UNDEFINED);
+    if (ret < 0)
         return ret;
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 1, 0, &s->factor_tables_dev, 0, sizeof(s->idct_factor),
+                                          VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 2, 0, &slot->dequant_meta_dev, 0, meta_bytes,
+                                          VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 3, 0, &s->inv_scan_dev, 0, 2 * 64 * sizeof(uint32_t),
+                                          VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->dequant_shd, 0, 4, 0, &slot->idct_dev, 0, idct_bytes, VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+
+    ff_vk_exec_bind_shader(&s->vk, exec, &s->dequant_shd);
+    {
+        DVVkDequantPush pd = {
+            .num_blocks    = (uint32_t)num_blocks,
+            .iweight_bits  = (uint32_t)dv_vk_iweight_bits,
+            .output_stride = 128,
+            .output_base   = 0,
+        };
+
+        ff_vk_shader_update_push_const(&s->vk, exec, &s->dequant_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
     }
+    s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)((num_blocks + 3) / 4), 1, 1);
 
-    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: uploaded reconstructed frame to Vulkan output\n");
+    buf_bar[0] = (VkBufferMemoryBarrier2){
+        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT,
+        .dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer              = slot->idct_dev.buf,
+        .offset              = 0,
+        .size                = idct_bytes,
+    };
+    s->vk.vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo){
+                                                  .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                                  .bufferMemoryBarrierCount = 1,
+                                                  .pBufferMemoryBarriers    = buf_bar,
+                                              });
 
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_calc_shd, 0, 0, 0, &slot->idct_dev, 0, idct_bytes, VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_calc_shd, 0, 1, 0, &slot->recon_jobs_dev, 0, job_bytes,
+                                          VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_calc_shd, 0, 2, 0, &slot->recon_plane_dev, 0, plane_bytes,
+                                          VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+
+    ff_vk_exec_bind_shader(&s->vk, exec, &s->recon_calc_shd);
+    {
+        DVVkReconCalcPush pd = {0};
+
+        for (int i = 0; i < 4; i++) {
+            pd.width[i]        = src_widths[i];
+            pd.height[i]       = src_heights[i];
+            pd.plane_offset[i] = (uint32_t)src_offsets[i];
+            pd.plane_stride[i] = (uint32_t)src_linesizes[i];
+        }
+        pd.num_blocks            = (uint32_t)num_blocks;
+        pd.blocks_per_mb         = (uint32_t)s->sys->bpm;
+        pd.chroma_w_shift        = chroma_w_shift;
+        pd.chroma_h_shift        = chroma_h_shift;
+        pd.is_yuv411             = is_yuv411;
+        pd.last_mb_y             = (uint32_t)s->stats.last_mb_y;
+        pd.chroma_411_split_mb_x = (uint32_t)s->stats.chroma_411_split_mb_x;
+
+        ff_vk_shader_update_push_const(&s->vk, exec, &s->recon_calc_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
+    }
+    s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)FFMIN(num_blocks, 512),
+                           (uint32_t)((num_blocks + FFMIN(num_blocks, 512) - 1) / FFMIN(num_blocks, 512)), 1);
+
+    buf_bar[0] = (VkBufferMemoryBarrier2){
+        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT,
+        .dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer              = slot->recon_plane_dev.buf,
+        .offset              = 0,
+        .size                = plane_bytes,
+    };
+    s->vk.vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo){
+                                                  .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                                  .bufferMemoryBarrierCount = 1,
+                                                  .pBufferMemoryBarriers    = buf_bar,
+                                              });
+
+    ret = ff_vk_exec_add_dep_frame(&s->vk, exec, dst, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    if (ret < 0)
+        return ret;
+    ret = ff_vk_create_imageviews(&s->vk, exec, out_views, dst, FF_VK_REP_FLOAT);
+    if (ret < 0)
+        return ret;
+
+    ff_vk_frame_barrier(&s->vk, exec, dst, img_bar, &nb_img_bar, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_QUEUE_FAMILY_IGNORED);
+    s->vk.vkfn.CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo){
+                                                  .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                                  .pImageMemoryBarriers    = img_bar,
+                                                  .imageMemoryBarrierCount = nb_img_bar,
+                                              });
+
+    ret = ff_vk_shader_update_desc_buffer(&s->vk, exec, &s->recon_shd, 0, 0, 0, &slot->recon_plane_dev, 0, plane_bytes,
+                                          VK_FORMAT_UNDEFINED);
+    if (ret < 0)
+        return ret;
+    ff_vk_shader_update_img_array(&s->vk, exec, &s->recon_shd, dst, out_views, 0, 1, VK_IMAGE_LAYOUT_GENERAL, VK_NULL_HANDLE);
+    ff_vk_exec_bind_shader(&s->vk, exec, &s->recon_shd);
+    {
+        DVVkReconPush pd = {0};
+
+        for (int i = 0; i < 4; i++) {
+            pd.width[i]        = src_widths[i];
+            pd.height[i]       = src_heights[i];
+            pd.plane_offset[i] = (uint32_t)src_offsets[i];
+            pd.plane_stride[i] = (uint32_t)src_linesizes[i];
+        }
+        pd.chroma_w_shift = chroma_w_shift;
+        pd.chroma_h_shift = chroma_h_shift;
+
+        ff_vk_shader_update_push_const(&s->vk, exec, &s->recon_shd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
+    }
+    s->vk.vkfn.CmdDispatch(exec->buf, (uint32_t)groups_x, (uint32_t)groups_y, 1);
+
+    signal_value = ++s->next_timeline_value;
+    ret          = dv_vk_exec_add_signal_sem(&s->vk, exec, s->frame_timeline_sem, signal_value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_vk_exec_submit(&s->vk, exec);
+    if (ret < 0)
+        return ret;
+
+    slot->completed_value = signal_value;
+    s->idct_upload_ready  = 0;
+    s->active_frame_slot  = -1;
+
+    av_log(avctx, AV_LOG_DEBUG, "dv_vulkan: submitted fused GPU frame pipeline (%d blocks, slot %d, timeline %" PRIu64 ")\n",
+           num_blocks, (int)(slot - s->frame_slots), signal_value);
+    return 0;
+}
+
+static int dv_vk_stage_write_output(AVCodecContext *avctx, DVSubContext *s)
+{
+    (void)avctx;
+    (void)s;
+    return 0;
+}
+
+static int dv_vk_warmup_pipeline(AVCodecContext *avctx, DVSubContext *s)
+{
+    FFVkExecContext *exec;
+    int ret;
+
+    /* Submit empty command buffer to initialize queue/driver state */
+    exec = ff_vk_exec_get(&s->vk, &s->idct_exec_pool);
+    if (!exec)
+        return 0;
+
+    ret = ff_vk_exec_start(&s->vk, exec);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_vk_exec_submit(&s->vk, exec);
+    if (ret < 0)
+        return ret;
+
+    ff_vk_exec_wait(&s->vk, exec);
     return 0;
 }
 
@@ -2311,6 +2025,8 @@ static int dv_vulkan_decode_init(AVCodecContext *avctx)
     if (!s)
         return AVERROR(EINVAL);
 
+    s->gpu_table_profile_key = -1;
+
     if (!avctx->hw_device_ctx && !avctx->hw_frames_ctx) {
         av_log(avctx, AV_LOG_ERROR, "dv_vulkan: neither hw_device_ctx nor hw_frames_ctx is set\n");
         return AVERROR(EINVAL);
@@ -2322,31 +2038,38 @@ static int dv_vulkan_decode_init(AVCodecContext *avctx)
 
     ff_thread_once(&dv_vk_rl_vlc_once, dv_vk_init_static_rl_vlc);
 
-    if (atomic_load(&dv_vk_global_disable_gpu_idct))
-        goto no_gpu;
-
     ret = ff_vk_init(&s->vk, avctx, avctx->hw_device_ctx, avctx->hw_frames_ctx);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: ff_vk_init failed (%d), using CPU IDCT fallback\n", ret);
-        goto no_gpu;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: ff_vk_init failed (%d)\n", ret);
+        goto fail;
     }
 
     qf = ff_vk_qf_find(&s->vk, VK_QUEUE_COMPUTE_BIT, 0);
     if (!qf) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: compute queue family not found, using CPU IDCT fallback\n");
-        goto no_gpu;
+        ret = AVERROR(ENOSYS);
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: compute queue family not found\n");
+        goto fail;
     }
 
-    ret = ff_vk_exec_pool_init(&s->vk, qf, &s->idct_exec_pool, 4, 0, 0, 0, NULL);
+    ret = ff_vk_exec_pool_init(&s->vk, qf, &s->idct_exec_pool, DV_VK_MAX_INFLIGHT_FRAMES, 0, 0, 0, NULL);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: exec pool init failed (%d), using CPU IDCT fallback\n", ret);
-        goto no_gpu;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: exec pool init failed (%d)\n", ret);
+        goto fail;
+    }
+
+    s->transfer_qf = ff_vk_qf_find(&s->vk, VK_QUEUE_TRANSFER_BIT, VK_QUEUE_COMPUTE_BIT);
+    if (s->transfer_qf && s->transfer_qf->idx != qf->idx) {
+        ret = ff_vk_exec_pool_init(&s->vk, s->transfer_qf, &s->transfer_pool, DV_VK_MAX_INFLIGHT_FRAMES, 0, 0, 0, NULL);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "dv_vulkan: transfer pool init failed (%d)\n", ret);
+            goto fail;
+        }
     }
 
     ret = ff_vk_shader_init(&s->vk, &s->idct_shd, "dv_idct", VK_SHADER_STAGE_COMPUTE_BIT, NULL, 0, 8, 8, 1, 0);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: shader init failed (%d), using CPU IDCT fallback\n", ret);
-        goto no_gpu;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: shader init failed (%d)\n", ret);
+        goto fail;
     }
 
     ff_vk_shader_add_push_const(&s->idct_shd, 0, sizeof(DVVkIDCTPush), VK_SHADER_STAGE_COMPUTE_BIT);
@@ -2367,59 +2090,71 @@ static int dv_vulkan_decode_init(AVCodecContext *avctx)
 #if CONFIG_LIBGLSLANG || CONFIG_LIBSHADERC
     spv = ff_vk_spirv_init();
     if (!spv) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: no in-memory SPIR-V compiler backend, using CPU IDCT fallback\n");
-        goto no_gpu;
+        ret = AVERROR_EXTERNAL;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: no in-memory SPIR-V compiler backend\n");
+        goto fail;
     }
 
     ret = dv_vk_get_cached_or_compile_spv(spv, &s->vk, &s->idct_shd, &dv_vk_cached_idct_spv, &dv_vk_cached_idct_spv_len, &spv_data,
                                           &spv_len, &opaque);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: SPIR-V compiler path failed (%d), using CPU IDCT fallback\n", ret);
-        goto no_gpu;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: SPIR-V compiler path failed (%d)\n", ret);
+        goto fail;
     }
     spv_compiled = 1;
 #else
-    av_log(avctx, AV_LOG_WARNING, "dv_vulkan: built without SPIR-V compiler backend, using CPU IDCT fallback\n");
-    goto no_gpu;
+    av_log(avctx, AV_LOG_ERROR, "dv_vulkan: built without SPIR-V compiler backend\n");
+    return AVERROR_EXTERNAL;
 #endif
 
     ret = ff_vk_shader_link(&s->vk, &s->idct_shd, spv_data, spv_len, "main");
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: shader link failed (%d), using CPU IDCT fallback\n", ret);
-        goto no_gpu;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: shader link failed (%d)\n", ret);
+        goto fail;
     }
 
     ret = ff_vk_shader_register_exec(&s->vk, &s->idct_exec_pool, &s->idct_shd);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: shader register failed (%d), using CPU IDCT fallback\n", ret);
-        goto no_gpu;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: shader register failed (%d)\n", ret);
+        goto fail;
     }
 
     av_free(spv_data);
     spv_data = NULL;
     opaque   = NULL;
 
-    ret = ff_vk_shader_init(&s->vk, &s->dequant_shd, "dv_dequant", VK_SHADER_STAGE_COMPUTE_BIT, NULL, 0, 64, 1, 1, 0);
+    ret = ff_vk_shader_init(&s->vk, &s->dequant_shd, "dv_dequant", VK_SHADER_STAGE_COMPUTE_BIT, NULL, 0, 32, 8, 1, 0);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: dequant shader init failed (%d), GPU dequant unavailable\n", ret);
-        s->dequant_gpu_ready = 0;
-        goto dequant_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: dequant shader init failed (%d)\n", ret);
+        goto fail;
     }
 
     ff_vk_shader_add_push_const(&s->dequant_shd, 0, sizeof(DVVkDequantPush), VK_SHADER_STAGE_COMPUTE_BIT);
     {
         const FFVulkanDescriptorSetBinding dequant_desc[] = {
             {
-                .name        = "quant_buffer",
+                .name        = "blocks_buffer",
                 .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
-                .buf_content = "int quantized[];",
+                .buf_content = "uint blocks[];",
             },
             {
-                .name        = "factor_buffer",
+                .name        = "factor_tables",
                 .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
                 .buf_content = "uint factors[];",
+            },
+            {
+                .name        = "dequant_meta",
+                .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
+                .buf_content = "uvec2 meta[];",
+            },
+            {
+                .name        = "inv_scan_table",
+                .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
+                .buf_content = "uint inv_scan[];",
             },
             {
                 .name        = "output_buffer",
@@ -2428,37 +2163,33 @@ static int dv_vulkan_decode_init(AVCodecContext *avctx)
                 .buf_content = "int dequantized[];",
             },
         };
-        ff_vk_shader_add_descriptor_set(&s->vk, &s->dequant_shd, dequant_desc, 3, 0, 0);
+        ff_vk_shader_add_descriptor_set(&s->vk, &s->dequant_shd, dequant_desc, 5, 0, 0);
     }
     dv_vk_build_dequant_shader_source(&s->dequant_shd);
 
     ret = dv_vk_get_cached_or_compile_spv(spv, &s->vk, &s->dequant_shd, &dv_vk_cached_dequant_spv, &dv_vk_cached_dequant_spv_len,
                                           &dequant_spv_data, &dequant_spv_len, &dequant_opaque);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: dequant shader SPIR-V compilation failed (%d), GPU dequant unavailable\n", ret);
-        s->dequant_gpu_ready = 0;
-        goto dequant_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: dequant shader SPIR-V compilation failed (%d)\n", ret);
+        goto fail;
     }
 
     ret = ff_vk_shader_link(&s->vk, &s->dequant_shd, dequant_spv_data, dequant_spv_len, "main");
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: dequant shader link failed (%d), GPU dequant unavailable\n", ret);
-        s->dequant_gpu_ready = 0;
-        goto dequant_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: dequant shader link failed (%d)\n", ret);
+        goto fail;
     }
 
     ret = ff_vk_shader_register_exec(&s->vk, &s->idct_exec_pool, &s->dequant_shd);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: dequant shader register failed (%d), GPU dequant unavailable\n", ret);
-        s->dequant_gpu_ready = 0;
-        goto dequant_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: dequant shader register failed (%d)\n", ret);
+        goto fail;
     }
 
     s->dequant_gpu_ready = 1;
     if (!atomic_exchange(&dv_vk_global_logged_dequant_gpu_init, 1))
         av_log(avctx, AV_LOG_INFO, "dv_vulkan: GPU dequant shader initialized\n");
 
-dequant_skip:
     av_free(dequant_spv_data);
     dequant_spv_data = NULL;
     dequant_opaque   = NULL;
@@ -2469,8 +2200,8 @@ dequant_skip:
 
     ret = ff_vk_shader_init(&s->vk, &s->recon_calc_shd, "dv_recon_calc", VK_SHADER_STAGE_COMPUTE_BIT, NULL, 0, 8, 8, 1, 0);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon calc shader init failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon calc shader init failed (%d)\n", ret);
+        goto fail;
     }
 
     ff_vk_shader_add_push_const(&s->recon_calc_shd, 0, sizeof(DVVkReconCalcPush), VK_SHADER_STAGE_COMPUTE_BIT);
@@ -2503,20 +2234,20 @@ dequant_skip:
     ret = dv_vk_get_cached_or_compile_spv(spv, &s->vk, &s->recon_calc_shd, &dv_vk_cached_calc_spv, &dv_vk_cached_calc_spv_len,
                                           &calc_spv_data, &calc_spv_len, &calc_opaque);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon calc shader SPIR-V compilation failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon calc shader SPIR-V compilation failed (%d)\n", ret);
+        goto fail;
     }
 
     ret = ff_vk_shader_link(&s->vk, &s->recon_calc_shd, calc_spv_data, calc_spv_len, "main");
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon calc shader link failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon calc shader link failed (%d)\n", ret);
+        goto fail;
     }
 
     ret = ff_vk_shader_register_exec(&s->vk, &s->idct_exec_pool, &s->recon_calc_shd);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon calc shader register failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon calc shader register failed (%d)\n", ret);
+        goto fail;
     }
 
     av_free(calc_spv_data);
@@ -2526,8 +2257,8 @@ dequant_skip:
 
     ret = ff_vk_shader_init(&s->vk, &s->recon_shd, "dv_recon", VK_SHADER_STAGE_COMPUTE_BIT, NULL, 0, 8, 8, 1, 0);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon shader init failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon shader init failed (%d)\n", ret);
+        goto fail;
     }
 
     ff_vk_shader_add_push_const(&s->recon_shd, 0, sizeof(DVVkReconPush), VK_SHADER_STAGE_COMPUTE_BIT);
@@ -2557,20 +2288,20 @@ dequant_skip:
     ret = dv_vk_get_cached_or_compile_spv(spv, &s->vk, &s->recon_shd, &dv_vk_cached_recon_spv, &dv_vk_cached_recon_spv_len, &recon_spv_data,
                                           &recon_spv_len, &recon_opaque);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon shader SPIR-V compilation failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon shader SPIR-V compilation failed (%d)\n", ret);
+        goto fail;
     }
 
     ret = ff_vk_shader_link(&s->vk, &s->recon_shd, recon_spv_data, recon_spv_len, "main");
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon shader link failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon shader link failed (%d)\n", ret);
+        goto fail;
     }
 
     ret = ff_vk_shader_register_exec(&s->vk, &s->idct_exec_pool, &s->recon_shd);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_WARNING, "dv_vulkan: recon shader register failed (%d), GPU reconstruction disabled\n", ret);
-        goto recon_skip;
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: recon shader register failed (%d)\n", ret);
+        goto fail;
     }
 
     av_free(recon_spv_data);
@@ -2581,18 +2312,37 @@ dequant_skip:
     s->recon_gpu_ready = 1;
     if (!atomic_exchange(&dv_vk_global_logged_recon_gpu_init, 1))
         av_log(avctx, AV_LOG_INFO, "dv_vulkan: GPU reconstruction shader initialized\n");
-    goto done;
 
-recon_skip:
-    s->recon_gpu_ready = 0;
-    goto done;
+    {
+        VkSemaphoreTypeCreateInfo sem_type = {
+            .sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+            .initialValue  = 0,
+        };
+        VkSemaphoreCreateInfo sem_create = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &sem_type,
+        };
 
-no_gpu:
-    s->dequant_gpu_ready = 0;
-    s->idct_gpu_ready    = 0;
-    s->recon_gpu_ready   = 0;
+        ret = s->vk.vkfn.CreateSemaphore(s->vk.hwctx->act_dev, &sem_create, s->vk.hwctx->alloc, &s->frame_timeline_sem);
+        if (ret != VK_SUCCESS) {
+            ret = AVERROR_EXTERNAL;
+            av_log(avctx, AV_LOG_ERROR, "dv_vulkan: timeline semaphore creation failed\n");
+            goto fail;
+        }
+    }
 
-done:
+    for (int i = 0; i < DV_VK_MAX_INFLIGHT_FRAMES; i++) {
+        ret = dv_vk_init_frame_slot(s, &s->frame_slots[i]);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "dv_vulkan: frame slot allocation failed (%d)\n", ret);
+            goto fail;
+        }
+    }
+
+    s->next_timeline_value = 0;
+    s->next_frame_slot     = 0;
+
     av_free(spv_data);
 #if CONFIG_LIBGLSLANG || CONFIG_LIBSHADERC
     if (spv_compiled && opaque)
@@ -2605,7 +2355,26 @@ done:
 #endif
 
     dv_vk_reset_frame_state(s);
+
+    ret = dv_vk_warmup_pipeline(avctx, s);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "dv_vulkan: pipeline warmup failed (%d)\n", ret);
+        goto fail;
+    }
+
     return 0;
+
+fail:
+    av_free(spv_data);
+#if CONFIG_LIBGLSLANG || CONFIG_LIBSHADERC
+    av_free(dequant_spv_data);
+    av_free(calc_spv_data);
+    av_free(recon_spv_data);
+    if (spv)
+        spv->uninit(&spv);
+#endif
+    dv_vulkan_decode_uninit(avctx);
+    return ret;
 }
 
 static int dv_vulkan_alloc_frame(AVCodecContext *avctx, AVFrame *frame)
@@ -2643,6 +2412,14 @@ static int dv_vulkan_decode_uninit(AVCodecContext *avctx)
     if (!s)
         return 0;
 
+    for (int i = 0; i < DV_VK_MAX_INFLIGHT_FRAMES; i++)
+        dv_vk_uninit_frame_slot(s, &s->frame_slots[i]);
+
+    if (s->frame_timeline_sem) {
+        s->vk.vkfn.DestroySemaphore(s->vk.hwctx->act_dev, s->frame_timeline_sem, s->vk.hwctx->alloc);
+        s->frame_timeline_sem = VK_NULL_HANDLE;
+    }
+
     av_freep(&s->frame_packet);
     s->frame_packet_size = 0;
 
@@ -2656,74 +2433,19 @@ static int dv_vulkan_decode_uninit(AVCodecContext *avctx)
     s->coeff_blocks_alloc = 0;
 
     av_freep(&s->quant_blocks);
-    av_freep(&s->factor_blocks);
+    av_freep(&s->dequant_meta_blocks);
     s->dequant_blocks_alloc = 0;
-
-    if (s->dequant_quant_buf.buf) {
-        if (s->dequant_quant_buf_map) {
-            ff_vk_unmap_buffer(&s->vk, &s->dequant_quant_buf, 0);
-            s->dequant_quant_buf_map = NULL;
-        }
-        ff_vk_free_buf(&s->vk, &s->dequant_quant_buf);
-        memset(&s->dequant_quant_buf, 0, sizeof(s->dequant_quant_buf));
-    }
-    s->dequant_quant_buf_size = 0;
-
-    if (s->dequant_factor_buf.buf) {
-        if (s->dequant_factor_buf_map) {
-            ff_vk_unmap_buffer(&s->vk, &s->dequant_factor_buf, 0);
-            s->dequant_factor_buf_map = NULL;
-        }
-        ff_vk_free_buf(&s->vk, &s->dequant_factor_buf);
-        memset(&s->dequant_factor_buf, 0, sizeof(s->dequant_factor_buf));
-    }
-    s->dequant_factor_buf_size = 0;
-
-    if (s->dequant_out_buf.buf) {
-        if (s->dequant_out_buf_map) {
-            ff_vk_unmap_buffer(&s->vk, &s->dequant_out_buf, 0);
-            s->dequant_out_buf_map = NULL;
-        }
-        ff_vk_free_buf(&s->vk, &s->dequant_out_buf);
-        memset(&s->dequant_out_buf, 0, sizeof(s->dequant_out_buf));
-    }
-    s->dequant_out_buf_size = 0;
-
-    if (s->idct_buf.buf) {
-        if (s->idct_buf_map) {
-            ff_vk_unmap_buffer(&s->vk, &s->idct_buf, 0);
-            s->idct_buf_map = NULL;
-        }
-        ff_vk_free_buf(&s->vk, &s->idct_buf);
-        memset(&s->idct_buf, 0, sizeof(s->idct_buf));
-    }
-    s->idct_buf_size = 0;
-
-    if (s->recon_jobs_buf.buf) {
-        if (s->recon_jobs_buf_map) {
-            ff_vk_unmap_buffer(&s->vk, &s->recon_jobs_buf, 0);
-            s->recon_jobs_buf_map = NULL;
-        }
-        ff_vk_free_buf(&s->vk, &s->recon_jobs_buf);
-        memset(&s->recon_jobs_buf, 0, sizeof(s->recon_jobs_buf));
-    }
-    s->recon_jobs_buf_size = 0;
-
-    if (s->recon_plane_buf.buf) {
-        if (s->recon_plane_buf_map) {
-            ff_vk_unmap_buffer(&s->vk, &s->recon_plane_buf, 0);
-            s->recon_plane_buf_map = NULL;
-        }
-        ff_vk_free_buf(&s->vk, &s->recon_plane_buf);
-        memset(&s->recon_plane_buf, 0, sizeof(s->recon_plane_buf));
-    }
-    s->recon_plane_buf_size = 0;
+    dv_vk_free_buffer(&s->vk, &s->factor_tables_dev, NULL);
+    dv_vk_free_buffer(&s->vk, &s->inv_scan_dev, NULL);
+    s->gpu_table_profile_key = -1;
 
     ff_vk_shader_free(&s->vk, &s->dequant_shd);
     ff_vk_shader_free(&s->vk, &s->idct_shd);
     ff_vk_shader_free(&s->vk, &s->recon_calc_shd);
     ff_vk_shader_free(&s->vk, &s->recon_shd);
     ff_vk_exec_pool_free(&s->vk, &s->idct_exec_pool);
+    if (s->transfer_qf)
+        ff_vk_exec_pool_free(&s->vk, &s->transfer_pool);
     ff_vk_uninit(&s->vk);
     memset(&s->dequant_shd, 0, sizeof(s->dequant_shd));
     memset(&s->idct_shd, 0, sizeof(s->idct_shd));
@@ -2734,13 +2456,10 @@ static int dv_vulkan_decode_uninit(AVCodecContext *avctx)
     s->idct_gpu_ready    = 0;
     s->recon_gpu_ready   = 0;
 
-    av_freep(&s->plane_staging);
-    s->plane_staging_size = 0;
-
-    av_freep(&s->decode_plane_staging);
-    s->decode_plane_staging_size = 0;
-
     s->sys = NULL;
+    s->next_timeline_value = 0;
+    s->next_frame_slot     = 0;
+    s->active_frame_slot   = -1;
 
     return 0;
 }
@@ -2803,11 +2522,7 @@ static int dv_vulkan_end_frame(AVCodecContext *avctx)
     if (ret < 0)
         return ret;
 
-    ret = dv_vk_prepare_coeff_staging(s);
-    if (ret < 0)
-        return ret;
-
-    ret = dv_vk_prepare_plane_staging(s);
+    ret = dv_vk_prepare_coeff_staging(avctx, s);
     if (ret < 0)
         return ret;
 
